@@ -10,8 +10,10 @@ import subprocess
 import sys
 import time
 import uuid
+from html import escape
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote
 
 import cv2
 import gradio as gr
@@ -259,6 +261,20 @@ def format_progress(current: int, total: int) -> str:
         return f"{current}/0"
     percent = current / total * 100.0
     return f"{current}/{total} ({percent:.1f}%)"
+
+
+def build_output_link_html(file_path: str | Path | None) -> str:
+    if not file_path:
+        return "<div>Output link will appear here when the job finishes.</div>"
+    resolved = Path(file_path).resolve()
+    href = f"/gradio_api/file={quote(str(resolved), safe='/')}"
+    label = f"Open {escape(resolved.name)} in New Tab"
+    return (
+        f'<a href="{href}" target="_blank" rel="noopener noreferrer" '
+        'style="display:inline-block;padding:0.7rem 1rem;border-radius:0.6rem;'
+        'background:#1f2937;color:#fff;text-decoration:none;font-weight:600;">'
+        f"{label}</a>"
+    )
 
 
 def get_model_status_text() -> str:
@@ -827,7 +843,7 @@ def run_inference(
     def emit(message: str, video=None, download_file=None, log_file=None):
         nonlocal log_text
         log_text = f"{log_text}{message.rstrip()}\n"
-        return log_text, video, download_file, log_file, get_model_status_text()
+        return log_text, video, build_output_link_html(download_file), log_file, get_model_status_text()
 
     try:
         if not input_video:
@@ -1019,7 +1035,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
         logs = gr.Textbox(label="Progress / Logs", lines=20)
     with gr.Row():
         output_video = gr.Video(label="Output Video")
-        output_download = gr.DownloadButton(label="Download Output")
+        output_download = gr.HTML(label="Open Output", value=build_output_link_html(None))
         log_file = gr.File(label="Job Log")
 
     mode.change(
@@ -1040,4 +1056,8 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
 demo.queue(default_concurrency_limit=1)
 
 if __name__ == "__main__":
-    demo.launch(server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"), server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")))
+    demo.launch(
+        server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
+        server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
+        allowed_paths=[str(OUTPUT_ROOT), str(LOG_DIR)],
+    )
