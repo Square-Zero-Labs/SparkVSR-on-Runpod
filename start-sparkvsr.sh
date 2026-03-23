@@ -10,7 +10,6 @@ log() {
 SOURCE_DIR=/opt/sparkvsr_template
 TARGET_DIR=/workspace/SparkVSR
 LOG_DIR="${TARGET_DIR}/logs"
-MODEL_BASE_DIR="${TARGET_DIR}/pretrained_weights/CogVideoX1.5-5B-I2V"
 MODEL_STAGE2_DIR="${TARGET_DIR}/checkpoints/sparkvsr-s2/ckpt-500-sft"
 
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
@@ -20,7 +19,6 @@ export GRADIO_SERVER_PORT="${GRADIO_SERVER_PORT:-7860}"
 export SPARKVSR_ACCESS_PORT="${SPARKVSR_ACCESS_PORT:-7862}"
 export SPARKVSR_WORKSPACE_DIR="${TARGET_DIR}"
 export SPARKVSR_MODEL_PATH="${SPARKVSR_MODEL_PATH:-$MODEL_STAGE2_DIR}"
-export SPARKVSR_BASE_MODEL_DIR="${SPARKVSR_BASE_MODEL_DIR:-$MODEL_BASE_DIR}"
 
 if [ ! -f "${TARGET_DIR}/app.py" ]; then
     log "Restoring application files to ${TARGET_DIR}"
@@ -35,7 +33,6 @@ mkdir -p \
     "${TARGET_DIR}/in" \
     "${TARGET_DIR}/logs" \
     "${TARGET_DIR}/out" \
-    "${TARGET_DIR}/pretrained_weights" \
     "${HF_HOME}"
 
 download_snapshot() {
@@ -66,10 +63,6 @@ snapshot_download(
 )
 PY
 }
-
-export DOWNLOAD_REPO_ID="zai-org/CogVideoX1.5-5B-I2V"
-export DOWNLOAD_TARGET_DIR="${SPARKVSR_BASE_MODEL_DIR}"
-download_snapshot "${DOWNLOAD_REPO_ID}" "${DOWNLOAD_TARGET_DIR}" "CogVideoX base model"
 
 export DOWNLOAD_REPO_ID="JiongzeYu/SparkVSR"
 export DOWNLOAD_TARGET_DIR="${SPARKVSR_MODEL_PATH}"

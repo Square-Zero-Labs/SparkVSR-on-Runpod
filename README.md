@@ -13,7 +13,7 @@ The upstream SparkVSR source is included as a git subtree in [`SparkVSR-base`](.
   - API-assisted keyframes (`api`)
   - manual reference keyframes (`gt` via synthetic `GT-Video` staging)
 - nginx basic auth in front of Gradio
-- startup downloads for the official SparkVSR Stage-2 checkpoint and CogVideoX base model
+- startup download for the official SparkVSR Stage-2 checkpoint
 - GitHub Actions workflow that builds and pushes to GHCR on `main`, `docker`, and `v*` tags
 
 ## Repository Layout
@@ -57,6 +57,8 @@ The container proxies nginx on port `7862` to Gradio on port `7860`.
 5. Launch on an RTX 5090 pod.
 
 On first boot, the startup script restores the app into `/workspace/SparkVSR`, downloads the required models, configures nginx auth, and launches Gradio. Subsequent restarts reuse the cached model directories in `/workspace/SparkVSR`.
+
+The template only downloads `JiongzeYu/SparkVSR`. That Hugging Face repo already contains the full diffusers pipeline needed by `CogVideoXImageToVideoPipeline`, so the separate `zai-org/CogVideoX1.5-5B-I2V` base-model download is intentionally not used here.
 
 ## UI Behavior
 
