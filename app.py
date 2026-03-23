@@ -226,6 +226,7 @@ def build_inference_command(
     upscale: int,
     output_resolution: tuple[int, int] | None,
     reference_guidance: float,
+    cpu_offload: bool,
     seed: int,
     api_indices: list[int],
     manual_indices: list[int],
@@ -257,6 +258,8 @@ def build_inference_command(
         "--ref_guidance_scale",
         str(reference_guidance),
     ]
+    if cpu_offload:
+        command.append("--is_cpu_offload")
     if output_resolution:
         command.extend(["--output_resolution", str(output_resolution[0]), str(output_resolution[1])])
     if mode == "API Reference" and api_indices:
@@ -272,6 +275,7 @@ def run_inference(
     upscale,
     output_resolution,
     reference_guidance,
+    cpu_offload,
     explicit_indices,
     seed,
     *manual_row_values,
@@ -350,6 +354,7 @@ def run_inference(
                 upscale=int(upscale),
                 output_resolution=parsed_resolution,
                 reference_guidance=float(reference_guidance),
+                cpu_offload=bool(cpu_offload),
                 seed=int(seed),
                 api_indices=api_indices,
                 manual_indices=manual_indices,
@@ -417,6 +422,11 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
             upscale = gr.Slider(label="Upscale Factor", minimum=1, maximum=4, step=1, value=4)
             output_resolution = gr.Textbox(label="Optional Output Resolution", placeholder="720x1280")
             reference_guidance = gr.Slider(label="Reference Guidance Scale", minimum=0.0, maximum=5.0, step=0.1, value=1.0)
+            cpu_offload = gr.Checkbox(
+                label="Low VRAM Mode (CPU Offload)",
+                value=False,
+                info="Slower, but can help larger jobs fit on smaller GPUs or avoid CUDA OOM errors.",
+            )
             explicit_indices = gr.Textbox(
                 label="Explicit Reference Indices",
                 placeholder="0,16,32",
@@ -453,7 +463,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
     )
     run_button.click(
         run_inference,
-        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, explicit_indices, seed, *manual_components],
+        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, explicit_indices, seed, *manual_components],
         outputs=[logs, output_video, log_file],
     )
 
