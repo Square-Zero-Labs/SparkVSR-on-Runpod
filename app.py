@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import contextlib
+import gc
 import os
 import shlex
 import shutil
 import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Iterable
 
 import cv2
 import gradio as gr
+import torch
 
 
 APP_ROOT = Path(os.environ.get("SPARKVSR_WORKSPACE_DIR", Path(__file__).resolve().parent)).resolve()
@@ -21,6 +26,19 @@ OUTPUT_ROOT = APP_ROOT / "out"
 INPUT_ROOT = APP_ROOT / "in"
 MANUAL_REF_ROWS = 8
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+if str(SUBTREE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SUBTREE_ROOT))
+
+import sparkvsr_inference_script as spark_module
+from finetune.utils.ref_utils import _select_indices, get_ref_frames_api, save_ref_frames_locally
+
+
+PIPELINE_STATE = {
+    "pipe": None,
+    "cpu_offload": None,
+    "empty_prompt_embedding": None,
+}
 
 
 def ensure_runtime_dirs() -> None:
@@ -218,6 +236,332 @@ def mode_to_ref_mode(mode: str) -> str:
     raise ValueError(f"Unsupported mode: {mode}")
 
 
+def format_duration(total_seconds: float) -> str:
+    seconds = max(0, int(round(total_seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def get_model_status_text() -> str:
+    pipe = PIPELINE_STATE["pipe"]
+    if pipe is None:
+        return "Model status: unloaded"
+    if PIPELINE_STATE["cpu_offload"]:
+        return "Model status: loaded with CPU offload"
+    return "Model status: loaded on GPU"
+
+
+def clear_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def unload_loaded_pipeline() -> str:
+    pipe = PIPELINE_STATE["pipe"]
+    if pipe is not None:
+        try:
+            pipe.to("cpu")
+        except Exception:
+            pass
+    PIPELINE_STATE["pipe"] = None
+    PIPELINE_STATE["cpu_offload"] = None
+    PIPELINE_STATE["empty_prompt_embedding"] = None
+    clear_cuda_memory()
+    return get_model_status_text()
+
+
+def resolve_dtype():
+    return torch.bfloat16
+
+
+def load_empty_prompt_embedding():
+    empty_prompt_path = SUBTREE_ROOT / "pretrained_models" / "prompt_embeddings" / "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors"
+    if empty_prompt_path.exists():
+        return spark_module.load_file(str(empty_prompt_path))["prompt_embedding"]
+    return None
+
+
+def ensure_pipeline_loaded(cpu_offload: bool) -> tuple[object, object, bool]:
+    current_pipe = PIPELINE_STATE["pipe"]
+    current_mode = PIPELINE_STATE["cpu_offload"]
+    reused = current_pipe is not None and current_mode == cpu_offload
+    if reused:
+        return current_pipe, PIPELINE_STATE["empty_prompt_embedding"], True
+
+    if current_pipe is not None:
+        unload_loaded_pipeline()
+
+    pipe = spark_module.CogVideoXImageToVideoPipeline.from_pretrained(
+        str(MODEL_PATH),
+        torch_dtype=resolve_dtype(),
+        low_cpu_mem_usage=True,
+    )
+    pipe.scheduler = spark_module.CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+    if cpu_offload:
+        pipe.enable_sequential_cpu_offload()
+    else:
+        pipe.to("cuda")
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
+
+    PIPELINE_STATE["pipe"] = pipe
+    PIPELINE_STATE["cpu_offload"] = cpu_offload
+    PIPELINE_STATE["empty_prompt_embedding"] = load_empty_prompt_embedding()
+    return pipe, PIPELINE_STATE["empty_prompt_embedding"], False
+
+
+def prepare_video_tensor(video, upscale: int, output_resolution: tuple[int, int] | None, upscale_mode: str):
+    h_orig, w_orig = video.shape[2], video.shape[3]
+
+    if output_resolution is not None:
+        target_h, target_w = output_resolution
+        scale_h = target_h / h_orig
+        scale_w = target_w / w_orig
+        scale_factor = max(scale_h, scale_w)
+        scaled_h = int(h_orig * scale_factor)
+        scaled_w = int(w_orig * scale_factor)
+        video_up = torch.nn.functional.interpolate(
+            video,
+            size=(scaled_h, scaled_w),
+            mode=upscale_mode,
+            align_corners=False,
+        )
+        crop_top = (scaled_h - target_h) // 2
+        crop_left = (scaled_w - target_w) // 2
+        video_up = video_up[:, :, crop_top:crop_top + target_h, crop_left:crop_left + target_w]
+        pad_h_extra = (8 - target_h % 8) % 8
+        pad_w_extra = (8 - target_w % 8) % 8
+        if pad_h_extra > 0 or pad_w_extra > 0:
+            video_up = torch.nn.functional.pad(video_up, (0, pad_w_extra, 0, pad_h_extra))
+        effective_upscale = 1
+    else:
+        video_up = torch.nn.functional.interpolate(
+            video,
+            size=(h_orig * upscale, w_orig * upscale),
+            mode=upscale_mode,
+            align_corners=False,
+        )
+        effective_upscale = upscale
+
+    video_up = (video_up / 255.0 * 2.0) - 1.0
+    video_model = video_up.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+    return video_model, effective_upscale
+
+
+def collect_reference_frames(
+    ref_mode: str,
+    video_path: Path,
+    output_dir: Path,
+    video_tensor_model: torch.Tensor,
+    video_lr: torch.Tensor,
+    effective_upscale: int,
+    explicit_indices: list[int],
+    reference_guidance: float,
+):
+    del reference_guidance  # Guidance is applied later in the model call.
+    video_name = video_path.name
+    ref_frames_list = []
+
+    if ref_mode == "no_ref":
+        return ref_frames_list, []
+
+    if explicit_indices:
+        ref_indices = explicit_indices
+    else:
+        ref_indices = _select_indices(video_tensor_model.shape[2])
+
+    if ref_mode == "gt":
+        saved = save_ref_frames_locally(
+            video_path=str(video_path),
+            output_dir=str(output_dir / "ref_gt_cache" / video_path.stem),
+            video_id=video_path.stem,
+            is_match=True,
+            specific_indices=ref_indices,
+        )
+        for idx in ref_indices:
+            found = False
+            for saved_idx, saved_path in saved:
+                if saved_idx != idx:
+                    continue
+                img = spark_module.Image.open(saved_path).convert("RGB")
+                t_img = spark_module.transforms.ToTensor()(img)
+                t_img = t_img * 2.0 - 1.0
+                target_h, target_w = video_tensor_model.shape[-2], video_tensor_model.shape[-1]
+                if t_img.shape[-2:] != (target_h, target_w):
+                    gt_h, gt_w = t_img.shape[-2], t_img.shape[-1]
+                    orig_h_up = video_lr.shape[1] * effective_upscale
+                    orig_w_up = video_lr.shape[2] * effective_upscale
+                    if gt_h == orig_h_up and gt_w == orig_w_up:
+                        gt_pad_h = target_h - gt_h
+                        gt_pad_w = target_w - gt_w
+                        if gt_pad_h > 0 or gt_pad_w > 0:
+                            t_img = torch.nn.functional.pad(t_img, (0, gt_pad_w, 0, gt_pad_h), mode="replicate")
+                    else:
+                        t_img = torch.nn.functional.interpolate(
+                            t_img.unsqueeze(0),
+                            size=(target_h, target_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+                ref_frames_list.append(t_img)
+                found = True
+                break
+            if not found:
+                ref_frames_list.append(video_tensor_model[0, :, idx])
+
+    elif ref_mode == "api":
+        vid_01 = ((video_tensor_model[0] + 1.0) / 2.0).permute(1, 0, 2, 3)
+        api_cache_base = output_dir / "ref_api_cache"
+        target_h, target_w = video_tensor_model.shape[-2], video_tensor_model.shape[-1]
+        max_dim = max(target_h, target_w)
+        if max_dim <= 1536:
+            api_resolution = "1K"
+        elif max_dim <= 3000:
+            api_resolution = "2K"
+        else:
+            api_resolution = "4K"
+
+        api_res = get_ref_frames_api(
+            output_dir=str(api_cache_base / video_path.stem),
+            video_tensor=vid_01,
+            video_id=video_path.stem,
+            is_match=True,
+            specific_indices=ref_indices,
+            ref_prompt_mode="fixed",
+            resolution=api_resolution,
+        )
+        for idx in ref_indices:
+            found = False
+            for saved_idx, saved_tensor in api_res:
+                if saved_idx != idx:
+                    continue
+                target_h, target_w = video_tensor_model.shape[-2], video_tensor_model.shape[-1]
+                saved_tensor = spark_module.center_crop_to_aspect_ratio(saved_tensor, target_h, target_w)
+                if saved_tensor.shape[-2:] != (target_h, target_w):
+                    saved_tensor = torch.nn.functional.interpolate(
+                        saved_tensor.unsqueeze(0),
+                        size=(target_h, target_w),
+                        mode="bicubic",
+                        align_corners=False,
+                    ).squeeze(0)
+                ref_frames_list.append(saved_tensor)
+                found = True
+                break
+            if not found:
+                ref_frames_list.append(video_tensor_model[0, :, idx])
+    else:
+        raise ValueError(f"Unsupported reference mode: {ref_mode}")
+
+    return ref_frames_list, ref_indices
+
+
+def run_single_video_job(
+    pipe,
+    empty_prompt_embedding,
+    input_path: Path,
+    output_dir: Path,
+    fps: int,
+    mode: str,
+    upscale: int,
+    output_resolution: tuple[int, int] | None,
+    reference_guidance: float,
+    explicit_indices: list[int],
+):
+    ref_mode = mode_to_ref_mode(mode)
+    video, pad_f, pad_h, pad_w, _original_shape = spark_module.preprocess_video_match(str(input_path), is_match=True)
+    video_lr = video
+    video_tensor_model, effective_upscale = prepare_video_tensor(video, upscale, output_resolution, "bilinear")
+
+    ref_frames_list, ref_indices = collect_reference_frames(
+        ref_mode=ref_mode,
+        video_path=input_path,
+        output_dir=output_dir,
+        video_tensor_model=video_tensor_model,
+        video_lr=video_lr,
+        effective_upscale=effective_upscale,
+        explicit_indices=explicit_indices,
+        reference_guidance=reference_guidance,
+    )
+
+    _, _, num_frames, height, width = video_tensor_model.shape
+    overlap_t = 0
+    overlap_hw = (0, 0)
+    time_chunks = spark_module.make_temporal_chunks(num_frames, 0, overlap_t)
+    spatial_tiles = spark_module.make_spatial_tiles(height, width, (0, 0), overlap_hw)
+
+    output_video = torch.zeros_like(video_tensor_model)
+    for t_start, t_end in time_chunks:
+        for h_start, h_end, w_start, w_end in spatial_tiles:
+            video_chunk = video_tensor_model[:, :, t_start:t_end, h_start:h_end, w_start:w_end]
+            current_ref_frames = [rf[:, h_start:h_end, w_start:w_end] for rf in ref_frames_list]
+            generated_chunk = spark_module.process_video_ref_i2v(
+                pipe=pipe,
+                video=video_chunk,
+                prompt="",
+                ref_frames=current_ref_frames,
+                ref_indices=ref_indices,
+                chunk_start_idx=t_start,
+                noise_step=0,
+                sr_noise_step=399,
+                empty_prompt_embedding=empty_prompt_embedding,
+                ref_guidance_scale=reference_guidance,
+            )
+            region = spark_module.get_valid_tile_region(
+                t_start,
+                t_end,
+                h_start,
+                h_end,
+                w_start,
+                w_end,
+                video_tensor_model.shape,
+                overlap_t,
+                overlap_hw[0],
+                overlap_hw[1],
+            )
+            output_video[
+                :,
+                :,
+                region["out_t_start"]:region["out_t_end"],
+                region["out_h_start"]:region["out_h_end"],
+                region["out_w_start"]:region["out_w_end"],
+            ] = generated_chunk[
+                :,
+                :,
+                region["valid_t_start"]:region["valid_t_end"],
+                region["valid_h_start"]:region["valid_h_end"],
+                region["valid_w_start"]:region["valid_w_end"],
+            ]
+
+    video_generate = spark_module.remove_padding_and_extra_frames(output_video, pad_f, pad_h * effective_upscale, pad_w * effective_upscale)
+    out_file_path = output_dir / input_path.name.replace(".mkv", ".mp4")
+    spark_module.save_video_with_imageio(video_generate, str(out_file_path), fps=fps, format="yuv420p")
+    clear_cuda_memory()
+    return out_file_path
+
+
+class TeeWriter:
+    def __init__(self, handle):
+        self.handle = handle
+
+    def write(self, value):
+        self.handle.write(value)
+        self.handle.flush()
+        return len(value)
+
+    def flush(self):
+        self.handle.flush()
+
+
 def build_inference_command(
     input_path: Path,
     output_dir: Path,
@@ -283,11 +627,12 @@ def run_inference(
     ensure_runtime_dirs()
     log_text = ""
     current_log_path: Path | None = None
+    job_started_at = time.monotonic()
 
     def emit(message: str, video=None, log_file=None):
         nonlocal log_text
         log_text = f"{log_text}{message.rstrip()}\n"
-        return log_text, video, log_file
+        return log_text, video, log_file, get_model_status_text()
 
     try:
         if not input_video:
@@ -327,6 +672,13 @@ def run_inference(
             yield emit(f"Created job `{job_id}`.", None, str(log_path))
             yield emit(f"Prepared normalized input video at `{original_input}`.", None, str(log_path))
 
+            pipe, empty_prompt_embedding, reused_pipeline = ensure_pipeline_loaded(bool(cpu_offload))
+            if reused_pipeline:
+                yield emit("Reusing loaded SparkVSR pipeline.", None, str(log_path))
+            else:
+                mode_text = "CPU offload" if cpu_offload else "GPU"
+                yield emit(f"Loaded SparkVSR pipeline into memory ({mode_text} mode).", None, str(log_path))
+
             if mode == "Manual References":
                 staged_input = staging_dir / "LQ-Video" / f"{safe_name}.mp4"
                 staged_gt = staging_dir / "GT-Video" / f"{safe_name}.mp4"
@@ -344,9 +696,8 @@ def run_inference(
             else:
                 fps = get_video_fps(original_input)
                 command_input = original_input
-                manual_indices = []
 
-            command = build_inference_command(
+            render_parts = build_inference_command(
                 input_path=command_input,
                 output_dir=output_dir,
                 fps=fps,
@@ -357,38 +708,42 @@ def run_inference(
                 cpu_offload=bool(cpu_offload),
                 seed=int(seed),
                 api_indices=api_indices,
-                manual_indices=manual_indices,
+                manual_indices=[index for index, _ in manual_refs],
             )
-
-            rendered_command = " ".join(shlex.quote(part) for part in command)
+            rendered_command = " ".join(shlex.quote(part) for part in render_parts)
             log_file.write(rendered_command + "\n")
             log_file.flush()
             yield emit(f"Launching SparkVSR:\n{rendered_command}", None, str(log_path))
 
-            process = subprocess.Popen(
-                command,
-                cwd=SUBTREE_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=os.environ.copy(),
-            )
+            spark_module.set_seed(int(seed))
+            tee = TeeWriter(log_file)
+            with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+                generated_video = run_single_video_job(
+                    pipe=pipe,
+                    empty_prompt_embedding=empty_prompt_embedding,
+                    input_path=command_input,
+                    output_dir=output_dir,
+                    fps=fps,
+                    mode=mode,
+                    upscale=int(upscale),
+                    output_resolution=parsed_resolution,
+                    reference_guidance=float(reference_guidance),
+                    explicit_indices=[index for index, _ in manual_refs] if mode == "Manual References" else api_indices,
+                )
+            log_file.flush()
+            log_text = log_path.read_text(encoding="utf-8")
 
-            assert process.stdout is not None
-            for line in process.stdout:
-                log_file.write(line)
-                log_file.flush()
-                yield emit(line, None, str(log_path))
-
-            return_code = process.wait()
-            if return_code != 0:
-                raise RuntimeError(f"SparkVSR exited with status {return_code}.")
-
-        generated_video = find_generated_video(output_dir)
-        yield emit(f"Finished successfully. Output video: `{generated_video}`", str(generated_video), str(log_path))
+        elapsed = format_duration(time.monotonic() - job_started_at)
+        yield emit(
+            f"Finished successfully in {elapsed}. Output video: `{generated_video}`",
+            str(generated_video),
+            str(log_path),
+        )
     except Exception as exc:
-        yield emit(f"Error: {exc}", None, str(current_log_path) if current_log_path else None)
+        elapsed = format_duration(time.monotonic() - job_started_at)
+        if current_log_path and current_log_path.exists():
+            log_text = current_log_path.read_text(encoding="utf-8")
+        yield emit(f"Error after {elapsed}: {exc}", None, str(current_log_path) if current_log_path else None)
 
 
 def update_mode_visibility(mode: str):
@@ -398,6 +753,10 @@ def update_mode_visibility(mode: str):
         gr.update(visible=manual_visible),
         gr.update(visible=api_visible),
     )
+
+
+def unload_model():
+    return get_model_status_text() if PIPELINE_STATE["pipe"] is None else unload_loaded_pipeline()
 
 
 ensure_runtime_dirs()
@@ -410,6 +769,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
         `API Reference` requires `SPARKVSR_FAL_KEY`. `Manual References` accepts up to 8 frame-index/image pairs.
         """
     )
+    model_status = gr.Markdown(get_model_status_text())
 
     with gr.Row():
         with gr.Column(scale=2):
@@ -448,7 +808,9 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
                         image = gr.File(label="Reference Image", file_types=["image"], min_width=220)
                     manual_components.extend([enabled, frame_index, image])
 
-    run_button = gr.Button("Run SparkVSR", variant="primary")
+    with gr.Row():
+        run_button = gr.Button("Run SparkVSR", variant="primary")
+        unload_button = gr.Button("Unload Model")
 
     with gr.Row():
         logs = gr.Textbox(label="Progress / Logs", lines=20)
@@ -461,10 +823,14 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
         inputs=[mode],
         outputs=[manual_group, api_hint_group],
     )
+    unload_button.click(
+        unload_model,
+        outputs=[model_status],
+    )
     run_button.click(
         run_inference,
         inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, explicit_indices, seed, *manual_components],
-        outputs=[logs, output_video, log_file],
+        outputs=[logs, output_video, log_file, model_status],
     )
 
 demo.queue(default_concurrency_limit=1)
