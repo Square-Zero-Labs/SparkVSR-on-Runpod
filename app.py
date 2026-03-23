@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import imageio
 import os
 import shlex
 import shutil
@@ -26,6 +27,8 @@ OUTPUT_ROOT = APP_ROOT / "out"
 INPUT_ROOT = APP_ROOT / "in"
 MANUAL_REF_ROWS = 8
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+DEFAULT_CHUNK_LEN = max(0, int(os.environ.get("SPARKVSR_CHUNK_LEN", "25")))
+DEFAULT_OVERLAP_T = max(0, int(os.environ.get("SPARKVSR_OVERLAP_T", "8")))
 
 if str(SUBTREE_ROOT) not in sys.path:
     sys.path.insert(0, str(SUBTREE_ROOT))
@@ -251,6 +254,13 @@ def format_duration(total_seconds: float) -> str:
     return " ".join(parts)
 
 
+def format_progress(current: int, total: int) -> str:
+    if total <= 0:
+        return f"{current}/0"
+    percent = current / total * 100.0
+    return f"{current}/{total} ({percent:.1f}%)"
+
+
 def get_model_status_text() -> str:
     pipe = PIPELINE_STATE["pipe"]
     if pipe is None:
@@ -320,71 +330,195 @@ def ensure_pipeline_loaded(cpu_offload: bool) -> tuple[object, object, bool]:
     return pipe, PIPELINE_STATE["empty_prompt_embedding"], False
 
 
-def prepare_video_tensor(video, upscale: int, output_resolution: tuple[int, int] | None, upscale_mode: str):
-    h_orig, w_orig = video.shape[2], video.shape[3]
+def get_chunk_settings(total_frames: int) -> tuple[int, int]:
+    if DEFAULT_CHUNK_LEN <= 0 or total_frames <= DEFAULT_CHUNK_LEN:
+        return 0, 0
+    overlap = min(DEFAULT_OVERLAP_T, DEFAULT_CHUNK_LEN - 1)
+    return DEFAULT_CHUNK_LEN, overlap
+
+
+def decord_to_torch(frames) -> torch.Tensor:
+    if isinstance(frames, torch.Tensor):
+        return frames
+    if hasattr(frames, "asnumpy"):
+        return torch.from_numpy(frames.asnumpy())
+    if hasattr(frames, "numpy"):
+        return torch.from_numpy(frames.numpy())
+    return torch.as_tensor(frames)
+
+
+def read_video_metadata(video_path: Path) -> dict[str, int | Path | object]:
+    video_reader = spark_module.decord.VideoReader(uri=video_path.as_posix())
+    total_frames = len(video_reader)
+    first_frame = decord_to_torch(video_reader[0])
+    height = int(first_frame.shape[0])
+    width = int(first_frame.shape[1])
+    channels = int(first_frame.shape[2])
+
+    pad_f = 0
+    remainder = (total_frames - 1) % 8
+    if remainder != 0:
+        pad_f = 8 - remainder
+
+    pad_h = (4 - height % 4) % 4
+    pad_w = (4 - width % 4) % 4
+
+    return {
+        "video_path": video_path,
+        "video_reader": video_reader,
+        "total_frames": total_frames,
+        "padded_frames": total_frames + pad_f,
+        "height": height,
+        "width": width,
+        "channels": channels,
+        "pad_f": pad_f,
+        "pad_h": pad_h,
+        "pad_w": pad_w,
+    }
+
+
+def compute_output_geometry(metadata: dict[str, int | Path | object], upscale: int, output_resolution: tuple[int, int] | None) -> dict[str, int | float | None]:
+    input_height = int(metadata["height"]) + int(metadata["pad_h"])
+    input_width = int(metadata["width"]) + int(metadata["pad_w"])
 
     if output_resolution is not None:
-        target_h, target_w = output_resolution
-        scale_h = target_h / h_orig
-        scale_w = target_w / w_orig
+        final_output_h, final_output_w = output_resolution
+        scale_h = final_output_h / input_height
+        scale_w = final_output_w / input_width
         scale_factor = max(scale_h, scale_w)
-        scaled_h = int(h_orig * scale_factor)
-        scaled_w = int(w_orig * scale_factor)
-        video_up = torch.nn.functional.interpolate(
-            video,
-            size=(scaled_h, scaled_w),
-            mode=upscale_mode,
-            align_corners=False,
-        )
-        crop_top = (scaled_h - target_h) // 2
-        crop_left = (scaled_w - target_w) // 2
-        video_up = video_up[:, :, crop_top:crop_top + target_h, crop_left:crop_left + target_w]
-        pad_h_extra = (8 - target_h % 8) % 8
-        pad_w_extra = (8 - target_w % 8) % 8
-        if pad_h_extra > 0 or pad_w_extra > 0:
-            video_up = torch.nn.functional.pad(video_up, (0, pad_w_extra, 0, pad_h_extra))
+        scaled_h = int(input_height * scale_factor)
+        scaled_w = int(input_width * scale_factor)
+        crop_top = (scaled_h - final_output_h) // 2
+        crop_left = (scaled_w - final_output_w) // 2
+        output_pad_h = (8 - final_output_h % 8) % 8
+        output_pad_w = (8 - final_output_w % 8) % 8
+        process_output_h = final_output_h + output_pad_h
+        process_output_w = final_output_w + output_pad_w
         effective_upscale = 1
     else:
+        scale_factor = None
+        scaled_h = None
+        scaled_w = None
+        crop_top = 0
+        crop_left = 0
+        output_pad_h = int(metadata["pad_h"]) * upscale
+        output_pad_w = int(metadata["pad_w"]) * upscale
+        process_output_h = input_height * upscale
+        process_output_w = input_width * upscale
+        final_output_h = int(metadata["height"]) * upscale
+        final_output_w = int(metadata["width"]) * upscale
+        effective_upscale = upscale
+
+    return {
+        "input_height_padded": input_height,
+        "input_width_padded": input_width,
+        "process_output_h": process_output_h,
+        "process_output_w": process_output_w,
+        "final_output_h": final_output_h,
+        "final_output_w": final_output_w,
+        "output_pad_h": output_pad_h,
+        "output_pad_w": output_pad_w,
+        "scale_factor": scale_factor,
+        "scaled_h": scaled_h,
+        "scaled_w": scaled_w,
+        "crop_top": crop_top,
+        "crop_left": crop_left,
+        "effective_upscale": effective_upscale,
+    }
+
+
+def read_video_chunk(video_reader, start_frame: int, end_frame: int, total_frames: int, pad_h: int, pad_w: int) -> torch.Tensor:
+    read_indices = [min(index, total_frames - 1) for index in range(start_frame, end_frame)]
+    frames = decord_to_torch(video_reader.get_batch(read_indices))
+    if pad_h > 0 or pad_w > 0:
+        frames = torch.nn.functional.pad(frames, pad=(0, 0, 0, pad_w, 0, pad_h))
+    return frames.float().permute(0, 3, 1, 2).contiguous()
+
+
+def prepare_video_chunk_for_model(video_chunk: torch.Tensor, geometry: dict[str, int | float | None], upscale_mode: str) -> torch.Tensor:
+    if geometry["scale_factor"] is not None:
         video_up = torch.nn.functional.interpolate(
-            video,
-            size=(h_orig * upscale, w_orig * upscale),
+            video_chunk,
+            size=(int(geometry["scaled_h"]), int(geometry["scaled_w"])),
             mode=upscale_mode,
             align_corners=False,
         )
-        effective_upscale = upscale
+        crop_top = int(geometry["crop_top"])
+        crop_left = int(geometry["crop_left"])
+        final_h = int(geometry["final_output_h"])
+        final_w = int(geometry["final_output_w"])
+        video_up = video_up[:, :, crop_top:crop_top + final_h, crop_left:crop_left + final_w]
+        if int(geometry["output_pad_h"]) > 0 or int(geometry["output_pad_w"]) > 0:
+            video_up = torch.nn.functional.pad(
+                video_up,
+                (0, int(geometry["output_pad_w"]), 0, int(geometry["output_pad_h"])),
+            )
+    else:
+        video_up = torch.nn.functional.interpolate(
+            video_chunk,
+            size=(int(geometry["process_output_h"]), int(geometry["process_output_w"])),
+            mode=upscale_mode,
+            align_corners=False,
+        )
 
     video_up = (video_up / 255.0 * 2.0) - 1.0
-    video_model = video_up.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
-    return video_model, effective_upscale
+    return video_up.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+
+
+def prepare_reference_tensor(image_tensor: torch.Tensor, geometry: dict[str, int | float | None]) -> torch.Tensor:
+    target_h = int(geometry["process_output_h"])
+    target_w = int(geometry["process_output_w"])
+    final_h = int(geometry["final_output_h"])
+    final_w = int(geometry["final_output_w"])
+
+    if image_tensor.shape[-2:] == (final_h, final_w) and (target_h != final_h or target_w != final_w):
+        image_tensor = torch.nn.functional.pad(image_tensor, (0, target_w - final_w, 0, target_h - final_h), mode="replicate")
+    elif image_tensor.shape[-2:] != (target_h, target_w):
+        image_tensor = torch.nn.functional.interpolate(
+            image_tensor.unsqueeze(0),
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return image_tensor
+
+
+def load_fallback_reference_frame(source_video: Path, frame_index: int, metadata: dict[str, int | Path | object], geometry: dict[str, int | float | None]) -> torch.Tensor:
+    video_reader = metadata["video_reader"]
+    raw_frame = decord_to_torch(video_reader[min(frame_index, int(metadata["total_frames"]) - 1)])
+    raw_frame = raw_frame.unsqueeze(0)
+    if int(metadata["pad_h"]) > 0 or int(metadata["pad_w"]) > 0:
+        raw_frame = torch.nn.functional.pad(raw_frame, pad=(0, 0, 0, int(metadata["pad_w"]), 0, int(metadata["pad_h"])))
+    raw_frame = raw_frame.float().permute(0, 3, 1, 2).contiguous()
+    prepared = prepare_video_chunk_for_model(raw_frame, geometry, "bilinear")
+    del source_video
+    return prepared[0, :, 0]
 
 
 def collect_reference_frames(
     ref_mode: str,
-    video_path: Path,
+    source_video: Path,
     output_dir: Path,
-    video_tensor_model: torch.Tensor,
-    video_lr: torch.Tensor,
-    effective_upscale: int,
+    metadata: dict[str, int | Path | object],
+    geometry: dict[str, int | float | None],
     explicit_indices: list[int],
-    reference_guidance: float,
 ):
-    del reference_guidance  # Guidance is applied later in the model call.
-    video_name = video_path.name
-    ref_frames_list = []
+    ref_frames_map: dict[int, torch.Tensor] = {}
 
     if ref_mode == "no_ref":
-        return ref_frames_list, []
+        return ref_frames_map, []
 
+    total_frames_padded = int(metadata["padded_frames"])
     if explicit_indices:
         ref_indices = explicit_indices
     else:
-        ref_indices = _select_indices(video_tensor_model.shape[2])
+        ref_indices = _select_indices(total_frames_padded)
 
     if ref_mode == "gt":
         saved = save_ref_frames_locally(
-            video_path=str(video_path),
-            output_dir=str(output_dir / "ref_gt_cache" / video_path.stem),
-            video_id=video_path.stem,
+            video_path=str(source_video),
+            output_dir=str(output_dir / "ref_gt_cache" / source_video.stem),
+            video_id=source_video.stem,
             is_match=True,
             specific_indices=ref_indices,
         )
@@ -396,34 +530,15 @@ def collect_reference_frames(
                 img = spark_module.Image.open(saved_path).convert("RGB")
                 t_img = spark_module.transforms.ToTensor()(img)
                 t_img = t_img * 2.0 - 1.0
-                target_h, target_w = video_tensor_model.shape[-2], video_tensor_model.shape[-1]
-                if t_img.shape[-2:] != (target_h, target_w):
-                    gt_h, gt_w = t_img.shape[-2], t_img.shape[-1]
-                    orig_h_up = video_lr.shape[1] * effective_upscale
-                    orig_w_up = video_lr.shape[2] * effective_upscale
-                    if gt_h == orig_h_up and gt_w == orig_w_up:
-                        gt_pad_h = target_h - gt_h
-                        gt_pad_w = target_w - gt_w
-                        if gt_pad_h > 0 or gt_pad_w > 0:
-                            t_img = torch.nn.functional.pad(t_img, (0, gt_pad_w, 0, gt_pad_h), mode="replicate")
-                    else:
-                        t_img = torch.nn.functional.interpolate(
-                            t_img.unsqueeze(0),
-                            size=(target_h, target_w),
-                            mode="bilinear",
-                            align_corners=False,
-                        ).squeeze(0)
-                ref_frames_list.append(t_img)
+                ref_frames_map[idx] = prepare_reference_tensor(t_img, geometry)
                 found = True
                 break
             if not found:
-                ref_frames_list.append(video_tensor_model[0, :, idx])
+                ref_frames_map[idx] = load_fallback_reference_frame(source_video, idx, metadata, geometry)
 
     elif ref_mode == "api":
-        vid_01 = ((video_tensor_model[0] + 1.0) / 2.0).permute(1, 0, 2, 3)
         api_cache_base = output_dir / "ref_api_cache"
-        target_h, target_w = video_tensor_model.shape[-2], video_tensor_model.shape[-1]
-        max_dim = max(target_h, target_w)
+        max_dim = max(int(geometry["process_output_h"]), int(geometry["process_output_w"]))
         if max_dim <= 1536:
             api_resolution = "1K"
         elif max_dim <= 3000:
@@ -432,9 +547,9 @@ def collect_reference_frames(
             api_resolution = "4K"
 
         api_res = get_ref_frames_api(
-            output_dir=str(api_cache_base / video_path.stem),
-            video_tensor=vid_01,
-            video_id=video_path.stem,
+            video_path=str(source_video),
+            output_dir=str(api_cache_base / source_video.stem),
+            video_id=source_video.stem,
             is_match=True,
             specific_indices=ref_indices,
             ref_prompt_mode="fixed",
@@ -445,24 +560,46 @@ def collect_reference_frames(
             for saved_idx, saved_tensor in api_res:
                 if saved_idx != idx:
                     continue
-                target_h, target_w = video_tensor_model.shape[-2], video_tensor_model.shape[-1]
-                saved_tensor = spark_module.center_crop_to_aspect_ratio(saved_tensor, target_h, target_w)
-                if saved_tensor.shape[-2:] != (target_h, target_w):
-                    saved_tensor = torch.nn.functional.interpolate(
-                        saved_tensor.unsqueeze(0),
-                        size=(target_h, target_w),
-                        mode="bicubic",
-                        align_corners=False,
-                    ).squeeze(0)
-                ref_frames_list.append(saved_tensor)
+                final_h = int(geometry["final_output_h"])
+                final_w = int(geometry["final_output_w"])
+                saved_tensor = spark_module.center_crop_to_aspect_ratio(saved_tensor, final_h, final_w)
+                ref_frames_map[idx] = prepare_reference_tensor(saved_tensor, geometry)
                 found = True
                 break
             if not found:
-                ref_frames_list.append(video_tensor_model[0, :, idx])
+                ref_frames_map[idx] = load_fallback_reference_frame(source_video, idx, metadata, geometry)
     else:
         raise ValueError(f"Unsupported reference mode: {ref_mode}")
 
-    return ref_frames_list, ref_indices
+    return ref_frames_map, ref_indices
+
+
+def write_chunk_frames(
+    writer,
+    video_chunk: torch.Tensor,
+    valid_t_start: int,
+    valid_t_end: int,
+    geometry: dict[str, int | float | None],
+    frames_remaining: int,
+) -> int:
+    if frames_remaining <= 0:
+        return 0
+
+    chunk = video_chunk[:, :, valid_t_start:valid_t_end, :, :]
+    if int(geometry["output_pad_h"]) > 0:
+        chunk = chunk[:, :, :, :-int(geometry["output_pad_h"]), :]
+    if int(geometry["output_pad_w"]) > 0:
+        chunk = chunk[:, :, :, :, :-int(geometry["output_pad_w"])]
+
+    frames = chunk[0].permute(1, 2, 3, 0)
+    if frames.shape[0] > frames_remaining:
+        frames = frames[:frames_remaining]
+    frames = (frames * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    for frame in frames:
+        writer.append_data(frame)
+    written = int(frames.shape[0])
+    del chunk, frames
+    return written
 
 
 def run_single_video_job(
@@ -478,75 +615,133 @@ def run_single_video_job(
     explicit_indices: list[int],
 ):
     ref_mode = mode_to_ref_mode(mode)
-    video, pad_f, pad_h, pad_w, _original_shape = spark_module.preprocess_video_match(str(input_path), is_match=True)
-    video_lr = video
-    video_tensor_model, effective_upscale = prepare_video_tensor(video, upscale, output_resolution, "bilinear")
-
-    ref_frames_list, ref_indices = collect_reference_frames(
+    metadata = read_video_metadata(input_path)
+    geometry = compute_output_geometry(metadata, upscale, output_resolution)
+    ref_frames_map, ref_indices = collect_reference_frames(
         ref_mode=ref_mode,
-        video_path=input_path,
+        source_video=input_path,
         output_dir=output_dir,
-        video_tensor_model=video_tensor_model,
-        video_lr=video_lr,
-        effective_upscale=effective_upscale,
+        metadata=metadata,
+        geometry=geometry,
         explicit_indices=explicit_indices,
-        reference_guidance=reference_guidance,
     )
 
-    _, _, num_frames, height, width = video_tensor_model.shape
-    overlap_t = 0
-    overlap_hw = (0, 0)
-    time_chunks = spark_module.make_temporal_chunks(num_frames, 0, overlap_t)
-    spatial_tiles = spark_module.make_spatial_tiles(height, width, (0, 0), overlap_hw)
+    chunk_len, overlap_t = get_chunk_settings(int(metadata["padded_frames"]))
+    time_chunks = spark_module.make_temporal_chunks(int(metadata["padded_frames"]), chunk_len, overlap_t)
+    out_file_path = output_dir / input_path.name.replace(".mkv", ".mp4")
+    written_frames = 0
+    total_real_frames = int(metadata["total_frames"])
+    total_chunks = len(time_chunks)
+    full_video_shape = (1, 3, int(metadata["padded_frames"]), int(geometry["process_output_h"]), int(geometry["process_output_w"]))
 
-    output_video = torch.zeros_like(video_tensor_model)
-    for t_start, t_end in time_chunks:
-        for h_start, h_end, w_start, w_end in spatial_tiles:
-            video_chunk = video_tensor_model[:, :, t_start:t_end, h_start:h_end, w_start:w_end]
-            current_ref_frames = [rf[:, h_start:h_end, w_start:w_end] for rf in ref_frames_list]
+    chunk_frames = chunk_len or int(metadata["padded_frames"])
+    summary_message = " ".join(
+        [
+            "Chunked processing:",
+            f"real_frames={total_real_frames}",
+            f"padded_frames={int(metadata['padded_frames'])}",
+            f"chunk_frames={chunk_frames}",
+            f"overlap_t={overlap_t}",
+            f"chunks={total_chunks}",
+            f"output={int(geometry['final_output_w'])}x{int(geometry['final_output_h'])}",
+        ]
+    )
+    print(summary_message)
+    yield {"type": "log", "message": summary_message}
+    plan_message = f"Chunk plan: {total_chunks} chunks total, up to {chunk_frames} frames per chunk, {overlap_t} frame overlap."
+    print(plan_message)
+    yield {"type": "log", "message": plan_message}
+
+    with imageio.get_writer(
+        str(out_file_path),
+        fps=fps,
+        codec="libx264",
+        pixelformat="yuv420p",
+        macro_block_size=None,
+        ffmpeg_params=["-crf", "10"],
+    ) as writer:
+        for chunk_index, (t_start, t_end) in enumerate(time_chunks, start=1):
+            current_ref_indices = [idx for idx in ref_indices if t_start <= idx < t_end]
+            start_message = " ".join(
+                [
+                    f"Chunk {chunk_index}/{total_chunks} started.",
+                    f"frames={t_start}:{t_end}",
+                    f"size={t_end - t_start}",
+                    f"refs={len(current_ref_indices)}",
+                    f"written={format_progress(written_frames, total_real_frames)}",
+                ]
+            )
+            print(start_message)
+            yield {"type": "log", "message": start_message}
+
+            chunk_started_at = time.monotonic()
+            chunk_lr = read_video_chunk(
+                metadata["video_reader"],
+                t_start,
+                t_end,
+                int(metadata["total_frames"]),
+                int(metadata["pad_h"]),
+                int(metadata["pad_w"]),
+            )
+            video_chunk_model = prepare_video_chunk_for_model(chunk_lr, geometry, "bilinear")
+            current_ref_frames = [ref_frames_map[idx] for idx in current_ref_indices]
+
             generated_chunk = spark_module.process_video_ref_i2v(
                 pipe=pipe,
-                video=video_chunk,
+                video=video_chunk_model,
                 prompt="",
                 ref_frames=current_ref_frames,
-                ref_indices=ref_indices,
+                ref_indices=current_ref_indices,
                 chunk_start_idx=t_start,
                 noise_step=0,
                 sr_noise_step=399,
                 empty_prompt_embedding=empty_prompt_embedding,
                 ref_guidance_scale=reference_guidance,
             )
+
             region = spark_module.get_valid_tile_region(
                 t_start,
                 t_end,
-                h_start,
-                h_end,
-                w_start,
-                w_end,
-                video_tensor_model.shape,
+                0,
+                int(geometry["process_output_h"]),
+                0,
+                int(geometry["process_output_w"]),
+                full_video_shape,
                 overlap_t,
-                overlap_hw[0],
-                overlap_hw[1],
+                0,
+                0,
             )
-            output_video[
-                :,
-                :,
-                region["out_t_start"]:region["out_t_end"],
-                region["out_h_start"]:region["out_h_end"],
-                region["out_w_start"]:region["out_w_end"],
-            ] = generated_chunk[
-                :,
-                :,
-                region["valid_t_start"]:region["valid_t_end"],
-                region["valid_h_start"]:region["valid_h_end"],
-                region["valid_w_start"]:region["valid_w_end"],
-            ]
+            remaining = total_real_frames - written_frames
+            chunk_written = write_chunk_frames(
+                writer=writer,
+                video_chunk=generated_chunk,
+                valid_t_start=region["valid_t_start"],
+                valid_t_end=region["valid_t_end"],
+                geometry=geometry,
+                frames_remaining=remaining,
+            )
+            written_frames += chunk_written
+            chunk_elapsed = format_duration(time.monotonic() - chunk_started_at)
+            done_message = " ".join(
+                [
+                    f"Chunk {chunk_index}/{total_chunks} finished in {chunk_elapsed}.",
+                    f"wrote={chunk_written}",
+                    f"total={format_progress(written_frames, total_real_frames)}",
+                ]
+            )
+            print(done_message)
+            yield {"type": "log", "message": done_message}
 
-    video_generate = spark_module.remove_padding_and_extra_frames(output_video, pad_f, pad_h * effective_upscale, pad_w * effective_upscale)
-    out_file_path = output_dir / input_path.name.replace(".mkv", ".mp4")
-    spark_module.save_video_with_imageio(video_generate, str(out_file_path), fps=fps, format="yuv420p")
-    clear_cuda_memory()
-    return out_file_path
+            del chunk_lr, video_chunk_model, generated_chunk, current_ref_frames
+            clear_cuda_memory()
+
+    if written_frames != total_real_frames:
+        raise RuntimeError(f"Frame count mismatch while writing output video: wrote {written_frames}, expected {total_real_frames}.")
+
+    output_message = f"Output encoding complete: {format_progress(written_frames, total_real_frames)} written to `{out_file_path}`."
+    print(output_message)
+    yield {"type": "log", "message": output_message}
+    yield {"type": "done", "output_path": out_file_path}
 
 
 class TeeWriter:
@@ -629,10 +824,10 @@ def run_inference(
     current_log_path: Path | None = None
     job_started_at = time.monotonic()
 
-    def emit(message: str, video=None, log_file=None):
+    def emit(message: str, video=None, download_file=None, log_file=None):
         nonlocal log_text
         log_text = f"{log_text}{message.rstrip()}\n"
-        return log_text, video, log_file, get_model_status_text()
+        return log_text, video, download_file, log_file, get_model_status_text()
 
     try:
         if not input_video:
@@ -669,15 +864,15 @@ def run_inference(
             original_input = job_dir / "input" / f"{safe_name}.mp4"
             original_input.parent.mkdir(parents=True, exist_ok=True)
             copy_or_convert_video(input_path, original_input)
-            yield emit(f"Created job `{job_id}`.", None, str(log_path))
-            yield emit(f"Prepared normalized input video at `{original_input}`.", None, str(log_path))
+            yield emit(f"Created job `{job_id}`.", None, None, str(log_path))
+            yield emit(f"Prepared normalized input video at `{original_input}`.", None, None, str(log_path))
 
             pipe, empty_prompt_embedding, reused_pipeline = ensure_pipeline_loaded(bool(cpu_offload))
             if reused_pipeline:
-                yield emit("Reusing loaded SparkVSR pipeline.", None, str(log_path))
+                yield emit("Reusing loaded SparkVSR pipeline.", None, None, str(log_path))
             else:
                 mode_text = "CPU offload" if cpu_offload else "GPU"
-                yield emit(f"Loaded SparkVSR pipeline into memory ({mode_text} mode).", None, str(log_path))
+                yield emit(f"Loaded SparkVSR pipeline into memory ({mode_text} mode).", None, None, str(log_path))
 
             if mode == "Manual References":
                 staged_input = staging_dir / "LQ-Video" / f"{safe_name}.mp4"
@@ -692,7 +887,7 @@ def run_inference(
                 )
                 command_input = staged_input
                 manual_indices = [index for index, _ in manual_refs]
-                yield emit("Prepared synthetic `GT-Video` staging for manual references.", None, str(log_path))
+                yield emit("Prepared synthetic `GT-Video` staging for manual references.", None, None, str(log_path))
             else:
                 fps = get_video_fps(original_input)
                 command_input = original_input
@@ -713,12 +908,13 @@ def run_inference(
             rendered_command = " ".join(shlex.quote(part) for part in render_parts)
             log_file.write(rendered_command + "\n")
             log_file.flush()
-            yield emit(f"Launching SparkVSR:\n{rendered_command}", None, str(log_path))
+            yield emit(f"Launching SparkVSR:\n{rendered_command}", None, None, str(log_path))
 
             spark_module.set_seed(int(seed))
             tee = TeeWriter(log_file)
             with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
-                generated_video = run_single_video_job(
+                generated_video = None
+                for event in run_single_video_job(
                     pipe=pipe,
                     empty_prompt_embedding=empty_prompt_embedding,
                     input_path=command_input,
@@ -729,7 +925,13 @@ def run_inference(
                     output_resolution=parsed_resolution,
                     reference_guidance=float(reference_guidance),
                     explicit_indices=[index for index, _ in manual_refs] if mode == "Manual References" else api_indices,
-                )
+                ):
+                    if event["type"] == "log":
+                        yield emit(event["message"], None, None, str(log_path))
+                    elif event["type"] == "done":
+                        generated_video = event["output_path"]
+                if generated_video is None:
+                    raise RuntimeError("SparkVSR finished without returning an output path.")
             log_file.flush()
             log_text = log_path.read_text(encoding="utf-8")
 
@@ -737,13 +939,14 @@ def run_inference(
         yield emit(
             f"Finished successfully in {elapsed}. Output video: `{generated_video}`",
             str(generated_video),
+            str(generated_video),
             str(log_path),
         )
     except Exception as exc:
         elapsed = format_duration(time.monotonic() - job_started_at)
         if current_log_path and current_log_path.exists():
             log_text = current_log_path.read_text(encoding="utf-8")
-        yield emit(f"Error after {elapsed}: {exc}", None, str(current_log_path) if current_log_path else None)
+        yield emit(f"Error after {elapsed}: {exc}", None, None, str(current_log_path) if current_log_path else None)
 
 
 def update_mode_visibility(mode: str):
@@ -816,6 +1019,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
         logs = gr.Textbox(label="Progress / Logs", lines=20)
     with gr.Row():
         output_video = gr.Video(label="Output Video")
+        output_download = gr.DownloadButton(label="Download Output")
         log_file = gr.File(label="Job Log")
 
     mode.change(
@@ -830,7 +1034,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
     run_button.click(
         run_inference,
         inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, explicit_indices, seed, *manual_components],
-        outputs=[logs, output_video, log_file, model_status],
+        outputs=[logs, output_video, output_download, log_file, model_status],
     )
 
 demo.queue(default_concurrency_limit=1)

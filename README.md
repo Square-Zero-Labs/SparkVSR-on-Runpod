@@ -54,6 +54,8 @@ The container proxies nginx on port `7862` to Gradio on port `7860`.
    - `HF_TOKEN` optional, but recommended for Hugging Face downloads
    - `SPARKVSR_FAL_KEY` required for API Reference mode
    - `SPARKVSR_API_PROMPT` optional override for the API enhancement prompt
+   - `SPARKVSR_CHUNK_LEN` optional temporal chunk size, default `25`
+   - `SPARKVSR_OVERLAP_T` optional temporal overlap between chunks, default `8`
 5. Launch on an RTX 5090 pod.
 
 On first boot, the startup script restores the app into `/workspace/SparkVSR`, downloads the required models, configures nginx auth, and launches Gradio. Subsequent restarts reuse the cached model directories in `/workspace/SparkVSR`.
@@ -67,6 +69,28 @@ The template only downloads `JiongzeYu/SparkVSR`. That Hugging Face repo already
 - `Manual References`: lets the user provide frame-index/image pairs; the wrapper creates a synthetic `GT-Video` clip so SparkVSR can reuse its upstream `ref_mode=gt` flow
 
 PiSA-SR is intentionally not exposed in this template.
+
+## Chunk Tuning
+
+The wrapper uses temporal chunking to keep RAM usage under control on long videos. By default it runs with:
+
+- `SPARKVSR_CHUNK_LEN=25`
+- `SPARKVSR_OVERLAP_T=8`
+
+That is a balanced default for larger GPUs such as an A40 or RTX 5090. If you need lower memory usage, reduce it.
+
+For larger GPUs such as an A40 or RTX 5090, a reasonable tuning path is:
+
+- default is `SPARKVSR_CHUNK_LEN=25`
+- keep `SPARKVSR_OVERLAP_T=8`
+- if memory is still comfortable, try `SPARKVSR_CHUNK_LEN=33`
+
+Practical tradeoff:
+
+- smaller chunk length: lower RAM and VRAM use, more overlap overhead, slower jobs
+- larger chunk length: fewer chunks, less repeated work, faster jobs, higher memory use
+
+The job log now reports the chunk plan up front, including total chunk count, frames per chunk, and overlap, so you can see how a given setting will behave on the pod.
 
 ## Logs And Restart
 
