@@ -2,7 +2,6 @@ import os
 import cv2
 import shutil
 import requests
-import fal_client
 from PIL import Image, UnidentifiedImageError
 from io import BytesIO
 from tqdm import tqdm

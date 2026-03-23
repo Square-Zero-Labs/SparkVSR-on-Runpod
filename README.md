@@ -28,7 +28,7 @@ The upstream SparkVSR source is included as a git subtree in [`SparkVSR-base`](.
 ## Build
 
 ```bash
-docker build -t sparkvsr-runpod:latest .
+docker build --platform=linux/amd64 -t sparkvsr-runpod:latest .
 ```
 
 ## Run Locally
