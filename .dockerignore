@@ -1,0 +1,11 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+out
+logs
+.cache
+SparkVSR

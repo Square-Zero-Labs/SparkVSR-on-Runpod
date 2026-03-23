@@ -23,7 +23,6 @@ import cv2
 from PIL import Image
 
 from pathlib import Path
-import pyiqa
 import imageio.v3 as iio
 import glob
 
@@ -689,6 +688,8 @@ def main():
         
     # Metrics
     if args.eval_metrics:
+        import pyiqa
+
         metrics_list = [m.strip().lower() for m in args.eval_metrics.split(',')]
         metrics_models = {}
         for name in metrics_list:

@@ -9,14 +9,18 @@ from tqdm import tqdm
 import torch
 from torchvision import transforms
 
-# ================= 配置区域 =================
-os.environ['FAL_KEY'] = 'your_fal_key'
+# ================= Configuration =================
+DEFAULT_PROMPT = "Super-Resolution and Restoration Task: Upscale this low-resolution image to high definition. The primary goal is to restore sharpness and clarity by effectively removing all types of degradation, including blur, heavy digital noise, grain, and JPEG compression artifacts."
 
-# 模型ID
+env_fal_key = os.environ.get("SPARKVSR_FAL_KEY") or os.environ.get("FAL_KEY")
+if env_fal_key:
+    os.environ["FAL_KEY"] = env_fal_key
+
+# Model ID
 FAL_MODEL_ID = "fal-ai/nano-banana-pro/edit"
 
-# 提示词
-TASK_PROMPT = "Super-Resolution and Restoration Task: Upscale this low-resolution image to high definition. The primary goal is to restore sharpness and clarity by effectively removing all types of degradation, including blur, heavy digital noise, grain, and JPEG compression artifacts."
+# Prompt
+TASK_PROMPT = os.environ.get("SPARKVSR_API_PROMPT", DEFAULT_PROMPT)
 
 
 # ==========================================

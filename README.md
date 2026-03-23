@@ -1,0 +1,78 @@
+# SparkVSR RunPod Template
+
+This repository packages [SparkVSR](https://github.com/taco-group/SparkVSR) for RunPod with a Gradio UI, nginx basic-auth, startup model caching, and GitHub Actions publishing to GHCR.
+
+The upstream SparkVSR source is included as a git subtree in [`SparkVSR-base`](./SparkVSR-base). That subtree remains subject to the Apache 2.0 license defined upstream.
+
+## What This Template Provides
+
+- RunPod-ready Docker image based on `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
+- RTX 5090-friendly CUDA 12.8+ runtime
+- Gradio app for:
+  - blind upscaling (`no_ref`)
+  - API-assisted keyframes (`api`)
+  - manual reference keyframes (`gt` via synthetic `GT-Video` staging)
+- nginx basic auth in front of Gradio
+- startup downloads for the official SparkVSR Stage-2 checkpoint and CogVideoX base model
+- GitHub Actions workflow that builds and pushes to GHCR on `main`, `docker`, and `v*` tags
+
+## Repository Layout
+
+- `SparkVSR-base/`: upstream SparkVSR subtree
+- `app.py`: Gradio application and inference wrapper
+- `start-sparkvsr.sh`: RunPod startup and model bootstrap
+- `restart-sparkvsr.sh`: helper to restart the app inside a running pod
+- `runtime-requirements.txt`: curated inference-only Python dependencies
+- `.github/workflows/docker-build.yml`: GHCR build/push workflow
+
+## Build
+
+```bash
+docker build -t sparkvsr-runpod:latest .
+```
+
+## Run Locally
+
+```bash
+docker run --gpus all -p 7862:7862 \
+  -e SPARKVSR_USERNAME=admin \
+  -e SPARKVSR_PASSWORD=sparkvsr \
+  -e HF_TOKEN=your_hf_token \
+  sparkvsr-runpod:latest
+```
+
+The container proxies nginx on port `7862` to Gradio on port `7860`.
+
+## Deploy On RunPod
+
+1. Publish the image from GitHub Actions or push a locally built image to your registry.
+2. Create a RunPod custom template that points to the image.
+3. Expose port `7862`.
+4. Set environment variables as needed:
+   - `SPARKVSR_USERNAME` default `admin`
+   - `SPARKVSR_PASSWORD` default `sparkvsr`
+   - `HF_TOKEN` optional, but recommended for Hugging Face downloads
+   - `SPARKVSR_FAL_KEY` required for API Reference mode
+   - `SPARKVSR_API_PROMPT` optional override for the API enhancement prompt
+5. Launch on an RTX 5090 pod.
+
+On first boot, the startup script restores the app into `/workspace/SparkVSR`, downloads the required models, configures nginx auth, and launches Gradio. Subsequent restarts reuse the cached model directories in `/workspace/SparkVSR`.
+
+## UI Behavior
+
+- `No Reference`: standard SparkVSR blind upscaling
+- `API Reference`: uses SparkVSR's upstream API-assisted reference path and requires `SPARKVSR_FAL_KEY`
+- `Manual References`: lets the user provide frame-index/image pairs; the wrapper creates a synthetic `GT-Video` clip so SparkVSR can reuse its upstream `ref_mode=gt` flow
+
+PiSA-SR is intentionally not exposed in this template.
+
+## Logs And Restart
+
+Inside the pod:
+
+```bash
+tail -f /workspace/SparkVSR/logs/sparkvsr.log
+restart-sparkvsr
+```
+
+Per-job logs are stored under `/workspace/SparkVSR/out/<job-id>/job.log`.
