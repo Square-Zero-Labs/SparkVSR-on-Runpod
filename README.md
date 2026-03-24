@@ -45,18 +45,14 @@ The container proxies nginx on port `7862` to Gradio on port `7860`.
 
 ## Deploy On RunPod
 
-1. Publish the image from GitHub Actions or push a locally built image to your registry.
-2. Create a RunPod custom template that points to the image.
-3. Expose port `7862`.
-4. Set environment variables as needed:
+1. Expose port `7862`.
+2. Set environment variables as needed:
    - `SPARKVSR_USERNAME` default `admin`
    - `SPARKVSR_PASSWORD` default `sparkvsr`
    - `HF_TOKEN` optional, but recommended for Hugging Face downloads
    - `SPARKVSR_FAL_KEY` required for API Reference mode
    - `SPARKVSR_API_PROMPT` optional override for the API enhancement prompt
-   - `SPARKVSR_CHUNK_LEN` optional temporal chunk size, default `25`
-   - `SPARKVSR_OVERLAP_T` optional temporal overlap between chunks, default `8`
-5. Launch on an RTX 5090 pod.
+3. Launch on an RTX 5090 or A40 pod.
 
 On first boot, the startup script restores the app into `/workspace/SparkVSR`, downloads the required models, configures nginx auth, and launches Gradio. Subsequent restarts reuse the cached model directories in `/workspace/SparkVSR`.
 
@@ -72,25 +68,22 @@ PiSA-SR is intentionally not exposed in this template.
 
 ## Chunk Tuning
 
-The wrapper uses temporal chunking to keep RAM usage under control on long videos. By default it runs with:
+The wrapper uses temporal chunking to keep RAM usage under control on long videos. Chunk controls now live in the Gradio UI on a per-job basis. The default UI values are:
 
-- `SPARKVSR_CHUNK_LEN=25`
-- `SPARKVSR_OVERLAP_T=8`
+- `Chunk Frames = 33`
+- `Chunk Overlap = 8`
 
-That is a balanced default for larger GPUs such as an A40 or RTX 5090. If you need lower memory usage, reduce it.
+Practical tuning path:
 
-For larger GPUs such as an A40 or RTX 5090, a reasonable tuning path is:
-
-- default is `SPARKVSR_CHUNK_LEN=25`
-- keep `SPARKVSR_OVERLAP_T=8`
-- if memory is still comfortable, try `SPARKVSR_CHUNK_LEN=33`
+- start with `33 / 8`
+- if you need lower memory usage, try `25 / 8` or `17 / 8`
+- if memory is still comfortable and you want fewer chunks, try `41 / 8`
+- set `Chunk Frames = 0` and `Chunk Overlap = 0` to disable chunking entirely
 
 Practical tradeoff:
 
 - smaller chunk length: lower RAM and VRAM use, more overlap overhead, slower jobs
 - larger chunk length: fewer chunks, less repeated work, faster jobs, higher memory use
-
-The job log now reports the chunk plan up front, including total chunk count, frames per chunk, and overlap, so you can see how a given setting will behave on the pod.
 
 ## Logs And Restart
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import imageio
+import json
 import os
 import shlex
 import shutil
@@ -29,8 +30,8 @@ OUTPUT_ROOT = APP_ROOT / "out"
 INPUT_ROOT = APP_ROOT / "in"
 MANUAL_REF_ROWS = 8
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-DEFAULT_CHUNK_LEN = max(0, int(os.environ.get("SPARKVSR_CHUNK_LEN", "25")))
-DEFAULT_OVERLAP_T = max(0, int(os.environ.get("SPARKVSR_OVERLAP_T", "8")))
+DEFAULT_UI_CHUNK_LEN = 33
+DEFAULT_UI_OVERLAP_T = 8
 
 if str(SUBTREE_ROOT) not in sys.path:
     sys.path.insert(0, str(SUBTREE_ROOT))
@@ -83,6 +84,25 @@ def parse_ref_indices(raw_value: str) -> list[int]:
     return indices
 
 
+def parse_chunk_setting(raw_value, label: str) -> int:
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an integer.") from exc
+    if value < 0:
+        raise ValueError(f"{label} must be zero or greater.")
+    return value
+
+
+def validate_chunk_settings(chunk_len: int, overlap_t: int) -> None:
+    if chunk_len == 0:
+        if overlap_t != 0:
+            raise ValueError("Chunk overlap must be 0 when chunk frames is 0.")
+        return
+    if overlap_t >= chunk_len:
+        raise ValueError("Chunk overlap must be smaller than chunk frames.")
+
+
 def validate_reference_indices(indices: Iterable[int]) -> None:
     indices = list(indices)
     if any(index < 0 for index in indices):
@@ -101,13 +121,119 @@ def resize_to_cover(image_bgr, width: int, height: int):
     return resized[start_y:start_y + height, start_x:start_x + width]
 
 
-def get_video_fps(video_path: Path) -> int:
+def parse_fractional_rate(raw_value: str | None) -> float | None:
+    if not raw_value or raw_value == "0/0":
+        return None
+    if "/" in raw_value:
+        numerator, denominator = raw_value.split("/", 1)
+        try:
+            numerator_value = float(numerator)
+            denominator_value = float(denominator)
+        except ValueError:
+            return None
+        if denominator_value == 0:
+            return None
+        return numerator_value / denominator_value
+    try:
+        return float(raw_value)
+    except ValueError:
+        return None
+
+
+def probe_video_stats(video_path: Path) -> dict[str, float | int | None]:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-count_frames",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames,duration",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode == 0:
+        try:
+            payload = json.loads(completed.stdout or "{}")
+            stream = (payload.get("streams") or [{}])[0]
+            format_payload = payload.get("format") or {}
+            avg_fps = parse_fractional_rate(stream.get("avg_frame_rate"))
+            raw_fps = parse_fractional_rate(stream.get("r_frame_rate"))
+            nb_frames_raw = stream.get("nb_read_frames") or stream.get("nb_frames")
+            frame_count = int(nb_frames_raw) if nb_frames_raw not in (None, "N/A") else None
+            duration_raw = stream.get("duration") or format_payload.get("duration")
+            duration = float(duration_raw) if duration_raw not in (None, "N/A") else None
+            if frame_count and duration and duration > 0:
+                exact_fps = frame_count / duration
+            else:
+                exact_fps = avg_fps or raw_fps
+            return {
+                "frame_count": frame_count,
+                "duration": duration,
+                "fps": exact_fps,
+                "avg_fps": avg_fps,
+                "raw_fps": raw_fps,
+            }
+        except (ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+            pass
+
     cap = cv2.VideoCapture(str(video_path))
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) or None
     finally:
         cap.release()
-    return int(round(fps)) if fps and fps > 1 else 16
+    if fps and fps > 1 and frame_count:
+        duration = frame_count / fps
+        return {
+            "frame_count": frame_count,
+            "duration": duration,
+            "fps": float(fps),
+            "avg_fps": float(fps),
+            "raw_fps": float(fps),
+        }
+    resolved_fps = float(fps) if fps and fps > 1 else 16.0
+    duration = (frame_count / resolved_fps) if frame_count else None
+    return {
+        "frame_count": frame_count,
+        "duration": duration,
+        "fps": resolved_fps,
+        "avg_fps": float(fps) if fps and fps > 1 else None,
+        "raw_fps": float(fps) if fps and fps > 1 else None,
+    }
+
+
+def get_video_fps(video_path: Path) -> float:
+    stats = probe_video_stats(video_path)
+    fps = stats.get("fps")
+    if isinstance(fps, (int, float)) and fps > 0:
+        return float(fps)
+    return 16.0
+
+
+def format_video_stats(label: str, stats: dict[str, float | int | None]) -> str:
+    frame_count = stats.get("frame_count")
+    duration = stats.get("duration")
+    fps = stats.get("fps")
+    avg_fps = stats.get("avg_fps")
+    raw_fps = stats.get("raw_fps")
+    parts = [f"{label}:"]
+    if frame_count is not None:
+        parts.append(f"frames={frame_count}")
+    if duration is not None:
+        parts.append(f"duration={duration:.6f}s")
+    if fps is not None:
+        parts.append(f"fps={fps:.6f}")
+    if avg_fps is not None and (fps is None or abs(avg_fps - fps) > 1e-6):
+        parts.append(f"avg_fps={avg_fps:.6f}")
+    if raw_fps is not None and (fps is None or abs(raw_fps - fps) > 1e-6) and (avg_fps is None or abs(raw_fps - avg_fps) > 1e-6):
+        parts.append(f"raw_fps={raw_fps:.6f}")
+    return " ".join(parts)
 
 
 def copy_or_convert_video(source: Path, destination: Path) -> None:
@@ -121,6 +247,10 @@ def copy_or_convert_video(source: Path, destination: Path) -> None:
         "-y",
         "-i",
         str(source),
+        "-map",
+        "0:v:0",
+        "-fps_mode",
+        "passthrough",
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -174,13 +304,13 @@ def build_synthetic_gt_video(
     references: list[tuple[int, Path]],
     upscale: int,
     output_resolution: tuple[int, int] | None,
-) -> int:
+) -> float:
     cap = cv2.VideoCapture(str(source_video))
     if not cap.isOpened():
         raise ValueError("Could not open the uploaded input video.")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 0
-    fps_value = int(round(fps)) if fps and fps > 1 else 16
+    source_stats = probe_video_stats(source_video)
+    fps_value = float(source_stats.get("fps") or 16.0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     target_height, target_width = output_resolution if output_resolution else (height * upscale, width * upscale)
@@ -346,11 +476,11 @@ def ensure_pipeline_loaded(cpu_offload: bool) -> tuple[object, object, bool]:
     return pipe, PIPELINE_STATE["empty_prompt_embedding"], False
 
 
-def get_chunk_settings(total_frames: int) -> tuple[int, int]:
-    if DEFAULT_CHUNK_LEN <= 0 or total_frames <= DEFAULT_CHUNK_LEN:
+def get_chunk_settings(total_frames: int, requested_chunk_len: int, requested_overlap_t: int) -> tuple[int, int]:
+    if requested_chunk_len <= 0 or total_frames <= requested_chunk_len:
         return 0, 0
-    overlap = min(DEFAULT_OVERLAP_T, DEFAULT_CHUNK_LEN - 1)
-    return DEFAULT_CHUNK_LEN, overlap
+    overlap = min(requested_overlap_t, requested_chunk_len - 1)
+    return requested_chunk_len, overlap
 
 
 def decord_to_torch(frames) -> torch.Tensor:
@@ -365,7 +495,13 @@ def decord_to_torch(frames) -> torch.Tensor:
 
 def read_video_metadata(video_path: Path) -> dict[str, int | Path | object]:
     video_reader = spark_module.decord.VideoReader(uri=video_path.as_posix())
-    total_frames = len(video_reader)
+    decord_frame_count = len(video_reader)
+    probed_stats = probe_video_stats(video_path)
+    probed_frame_count = probed_stats.get("frame_count")
+    if isinstance(probed_frame_count, int) and probed_frame_count > 0:
+        total_frames = probed_frame_count
+    else:
+        total_frames = decord_frame_count
     first_frame = decord_to_torch(video_reader[0])
     height = int(first_frame.shape[0])
     width = int(first_frame.shape[1])
@@ -383,6 +519,8 @@ def read_video_metadata(video_path: Path) -> dict[str, int | Path | object]:
         "video_path": video_path,
         "video_reader": video_reader,
         "total_frames": total_frames,
+        "decord_frame_count": decord_frame_count,
+        "probed_frame_count": probed_frame_count,
         "padded_frames": total_frames + pad_f,
         "height": height,
         "width": width,
@@ -623,12 +761,14 @@ def run_single_video_job(
     empty_prompt_embedding,
     input_path: Path,
     output_dir: Path,
-    fps: int,
+    fps: float,
     mode: str,
     upscale: int,
     output_resolution: tuple[int, int] | None,
     reference_guidance: float,
     explicit_indices: list[int],
+    chunk_len_setting: int,
+    overlap_t_setting: int,
 ):
     ref_mode = mode_to_ref_mode(mode)
     metadata = read_video_metadata(input_path)
@@ -642,7 +782,7 @@ def run_single_video_job(
         explicit_indices=explicit_indices,
     )
 
-    chunk_len, overlap_t = get_chunk_settings(int(metadata["padded_frames"]))
+    chunk_len, overlap_t = get_chunk_settings(int(metadata["padded_frames"]), chunk_len_setting, overlap_t_setting)
     time_chunks = spark_module.make_temporal_chunks(int(metadata["padded_frames"]), chunk_len, overlap_t)
     out_file_path = output_dir / input_path.name.replace(".mkv", ".mp4")
     written_frames = 0
@@ -664,6 +804,16 @@ def run_single_video_job(
     )
     print(summary_message)
     yield {"type": "log", "message": summary_message}
+    decord_frame_count = int(metadata["decord_frame_count"])
+    probed_frame_count = metadata["probed_frame_count"]
+    if isinstance(probed_frame_count, int) and probed_frame_count > 0 and probed_frame_count != decord_frame_count:
+        frame_count_message = (
+            "Frame count mismatch detected: "
+            f"ffprobe={probed_frame_count} decord={decord_frame_count}. "
+            f"Using ffprobe count for chunking and output duration."
+        )
+        print(frame_count_message)
+        yield {"type": "log", "message": frame_count_message}
     plan_message = f"Chunk plan: {total_chunks} chunks total, up to {chunk_frames} frames per chunk, {overlap_t} frame overlap."
     print(plan_message)
     yield {"type": "log", "message": plan_message}
@@ -776,13 +926,15 @@ class TeeWriter:
 def build_inference_command(
     input_path: Path,
     output_dir: Path,
-    fps: int,
+    fps: float,
     mode: str,
     upscale: int,
     output_resolution: tuple[int, int] | None,
     reference_guidance: float,
     cpu_offload: bool,
     seed: int,
+    chunk_len: int,
+    overlap_t: int,
     api_indices: list[int],
     manual_indices: list[int],
 ) -> list[str]:
@@ -812,6 +964,10 @@ def build_inference_command(
         "fixed",
         "--ref_guidance_scale",
         str(reference_guidance),
+        "--chunk_len",
+        str(chunk_len),
+        "--overlap_t",
+        str(overlap_t),
     ]
     if cpu_offload:
         command.append("--is_cpu_offload")
@@ -831,6 +987,8 @@ def run_inference(
     output_resolution,
     reference_guidance,
     cpu_offload,
+    chunk_len,
+    overlap_t,
     explicit_indices,
     seed,
     *manual_row_values,
@@ -859,6 +1017,9 @@ def run_inference(
 
         parsed_resolution = parse_optional_resolution(output_resolution)
         api_indices = parse_ref_indices(explicit_indices)
+        parsed_chunk_len = parse_chunk_setting(chunk_len, "Chunk frames")
+        parsed_overlap_t = parse_chunk_setting(overlap_t, "Chunk overlap")
+        validate_chunk_settings(parsed_chunk_len, parsed_overlap_t)
         manual_refs = collect_manual_references(list(manual_row_values))
 
         if mode == "API Reference" and not (os.environ.get("SPARKVSR_FAL_KEY") or os.environ.get("FAL_KEY")):
@@ -879,9 +1040,13 @@ def run_inference(
         with log_path.open("w", encoding="utf-8") as log_file:
             original_input = job_dir / "input" / f"{safe_name}.mp4"
             original_input.parent.mkdir(parents=True, exist_ok=True)
+            source_stats = probe_video_stats(input_path)
+            yield emit(format_video_stats("Uploaded input", source_stats), None, None, str(log_path))
             copy_or_convert_video(input_path, original_input)
+            normalized_stats = probe_video_stats(original_input)
             yield emit(f"Created job `{job_id}`.", None, None, str(log_path))
             yield emit(f"Prepared normalized input video at `{original_input}`.", None, None, str(log_path))
+            yield emit(format_video_stats("Normalized input", normalized_stats), None, None, str(log_path))
 
             pipe, empty_prompt_embedding, reused_pipeline = ensure_pipeline_loaded(bool(cpu_offload))
             if reused_pipeline:
@@ -918,6 +1083,8 @@ def run_inference(
                 reference_guidance=float(reference_guidance),
                 cpu_offload=bool(cpu_offload),
                 seed=int(seed),
+                chunk_len=parsed_chunk_len,
+                overlap_t=parsed_overlap_t,
                 api_indices=api_indices,
                 manual_indices=[index for index, _ in manual_refs],
             )
@@ -941,6 +1108,8 @@ def run_inference(
                     output_resolution=parsed_resolution,
                     reference_guidance=float(reference_guidance),
                     explicit_indices=[index for index, _ in manual_refs] if mode == "Manual References" else api_indices,
+                    chunk_len_setting=parsed_chunk_len,
+                    overlap_t_setting=parsed_overlap_t,
                 ):
                     if event["type"] == "log":
                         yield emit(event["message"], None, None, str(log_path))
@@ -1006,6 +1175,18 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
                 value=False,
                 info="Slower, but can help larger jobs fit on smaller GPUs or avoid CUDA OOM errors.",
             )
+            chunk_len = gr.Number(
+                label="Chunk Frames",
+                value=DEFAULT_UI_CHUNK_LEN,
+                precision=0,
+                info="Per-job temporal chunk size. Set 0 to disable chunking. Default 33 balances speed and memory on A40/5090-class GPUs.",
+            )
+            overlap_t = gr.Number(
+                label="Chunk Overlap",
+                value=DEFAULT_UI_OVERLAP_T,
+                precision=0,
+                info="Temporal overlap between chunks. Must be smaller than chunk frames. Use 0 when chunking is disabled.",
+            )
             explicit_indices = gr.Textbox(
                 label="Explicit Reference Indices",
                 placeholder="0,16,32",
@@ -1049,7 +1230,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
     )
     run_button.click(
         run_inference,
-        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, explicit_indices, seed, *manual_components],
+        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, chunk_len, overlap_t, explicit_indices, seed, *manual_components],
         outputs=[logs, output_video, output_download, log_file, model_status],
     )
 

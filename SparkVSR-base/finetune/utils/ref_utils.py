@@ -176,6 +176,7 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
     os.makedirs(TEMP_AUG_DIR, exist_ok=True)
 
     frame_list = []
+    extraction_failed_indices = []
     
     # Prefix for filenames
     prefix = f"{video_id}_" if video_id else ""
@@ -200,6 +201,11 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
         else:
             num_frames_to_use = target_frames if target_frames is not None else effective_frames
             indices = _select_indices(num_frames_to_use)
+
+        print(
+            f"[API] Frame selection from video path: total_frames={total_frames} "
+            f"effective_frames={effective_frames} selected_indices={indices}"
+        )
         
         for idx in indices:
             # If idx is beyond raw video length, we use the last frame (padding behavior)
@@ -211,6 +217,8 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
                 frame_filename = os.path.join(TEMP_INPUT_DIR, f"{prefix}frame_{idx:05d}.png")
                 cv2.imwrite(frame_filename, frame)
                 frame_list.append((idx, frame_filename))
+            else:
+                extraction_failed_indices.append((idx, read_idx))
         cap.release()
 
     elif video_tensor is not None:
@@ -233,6 +241,11 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
         else:
             num_frames_to_use = target_frames if target_frames is not None else effective_frames
             indices = _select_indices(num_frames_to_use)
+
+        print(
+            f"[API] Frame selection from tensor: total_frames={total_frames} "
+            f"effective_frames={effective_frames} selected_indices={indices}"
+        )
         
         for idx in indices:
             read_idx = min(idx, total_frames - 1)
@@ -259,6 +272,10 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
     
     # Sort frames by index
     frame_list.sort(key=lambda x: x[0])
+    extracted_indices = [idx for idx, _ in frame_list]
+    print(f"[API] Extracted {len(extracted_indices)} frame(s) for Fal: indices={extracted_indices}")
+    if extraction_failed_indices:
+        print(f"[API] Extraction failed for indices: {extraction_failed_indices}")
     
 
     # -------------------------------------------------------------
