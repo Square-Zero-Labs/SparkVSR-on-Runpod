@@ -263,18 +263,14 @@ def copy_or_convert_video(source: Path, destination: Path) -> None:
         raise RuntimeError(f"ffmpeg failed to normalize the input video: {completed.stderr.strip()}")
 
 
-def collect_manual_references(values: list[object]) -> list[tuple[int, Path]]:
+def collect_manual_references(values: list[object], visible_rows: int | None = None) -> list[tuple[int, Path]]:
     references: list[tuple[int, Path]] = []
-    for row_index in range(MANUAL_REF_ROWS):
-        base = row_index * 3
-        enabled = bool(values[base])
-        frame_index = values[base + 1]
-        image_value = values[base + 2]
-        if not enabled and frame_index in (None, "") and not image_value:
-            continue
-        if not enabled:
-            enabled = bool(image_value) or frame_index not in (None, "")
-        if not enabled:
+    row_count = MANUAL_REF_ROWS if visible_rows is None else max(0, min(MANUAL_REF_ROWS, int(visible_rows)))
+    for row_index in range(row_count):
+        base = row_index * 2
+        frame_index = values[base]
+        image_value = values[base + 1]
+        if frame_index in (None, "") and not image_value:
             continue
         if frame_index in (None, ""):
             raise ValueError(f"Manual reference row {row_index + 1} is missing a frame index.")
@@ -991,6 +987,7 @@ def run_inference(
     overlap_t,
     explicit_indices,
     seed,
+    manual_visible_rows,
     *manual_row_values,
 ):
     ensure_runtime_dirs()
@@ -1020,7 +1017,7 @@ def run_inference(
         parsed_chunk_len = parse_chunk_setting(chunk_len, "Chunk frames")
         parsed_overlap_t = parse_chunk_setting(overlap_t, "Chunk overlap")
         validate_chunk_settings(parsed_chunk_len, parsed_overlap_t)
-        manual_refs = collect_manual_references(list(manual_row_values))
+        manual_refs = collect_manual_references(list(manual_row_values), manual_visible_rows)
 
         if mode == "API Reference" and not (os.environ.get("SPARKVSR_FAL_KEY") or os.environ.get("FAL_KEY")):
             raise ValueError("API Reference mode requires the `SPARKVSR_FAL_KEY` environment variable.")
@@ -1143,6 +1140,22 @@ def update_mode_visibility(mode: str):
     )
 
 
+def update_manual_reference_rows(visible_rows: int):
+    clamped = max(1, min(MANUAL_REF_ROWS, int(visible_rows)))
+    updates = [gr.update(visible=row_index < clamped) for row_index in range(MANUAL_REF_ROWS)]
+    add_button_update = gr.update(interactive=clamped < MANUAL_REF_ROWS)
+    reset_button_update = gr.update(interactive=clamped > 1)
+    return [clamped, *updates, add_button_update, reset_button_update]
+
+
+def add_manual_reference_row(visible_rows: int):
+    return update_manual_reference_rows(visible_rows + 1)
+
+
+def reset_manual_reference_rows():
+    return update_manual_reference_rows(1)
+
+
 def unload_model():
     return get_model_status_text() if PIPELINE_STATE["pipe"] is None else unload_loaded_pipeline()
 
@@ -1158,6 +1171,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
         """
     )
     model_status = gr.Markdown(get_model_status_text())
+    manual_rows_state = gr.State(1)
 
     with gr.Row():
         with gr.Column(scale=2):
@@ -1199,14 +1213,18 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
                 gr.Markdown("`API Reference` uses SparkVSR's upstream API-assisted reference path and requires `SPARKVSR_FAL_KEY` in the container environment.")
 
             with gr.Group(visible=False) as manual_group:
-                gr.Markdown("Enable one row per manual reference, set the frame index, and upload the replacement image for that frame.")
+                gr.Markdown("Add one row per manual reference. A row is used when it has a frame index and an uploaded image.")
                 manual_components: list[gr.Component] = []
+                manual_row_containers: list[gr.Component] = []
                 for row in range(MANUAL_REF_ROWS):
-                    with gr.Row():
-                        enabled = gr.Checkbox(label=f"Use Row {row + 1}", value=False, min_width=120)
-                        frame_index = gr.Number(label="Frame Index", precision=0, min_width=140)
+                    with gr.Row(visible=row == 0) as manual_row:
+                        frame_index = gr.Textbox(label="Frame Index", placeholder="0", min_width=140)
                         image = gr.File(label="Reference Image", file_types=["image"], min_width=220)
-                    manual_components.extend([enabled, frame_index, image])
+                    manual_row_containers.append(manual_row)
+                    manual_components.extend([frame_index, image])
+                with gr.Row():
+                    add_manual_row_button = gr.Button("Add Reference Frame")
+                    reset_manual_rows_button = gr.Button("Reset Reference Frames", interactive=False)
 
     with gr.Row():
         run_button = gr.Button("Run SparkVSR", variant="primary")
@@ -1224,13 +1242,22 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
         inputs=[mode],
         outputs=[manual_group, api_hint_group],
     )
+    add_manual_row_button.click(
+        add_manual_reference_row,
+        inputs=[manual_rows_state],
+        outputs=[manual_rows_state, *manual_row_containers, add_manual_row_button, reset_manual_rows_button],
+    )
+    reset_manual_rows_button.click(
+        reset_manual_reference_rows,
+        outputs=[manual_rows_state, *manual_row_containers, add_manual_row_button, reset_manual_rows_button],
+    )
     unload_button.click(
         unload_model,
         outputs=[model_status],
     )
     run_button.click(
         run_inference,
-        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, chunk_len, overlap_t, explicit_indices, seed, *manual_components],
+        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, chunk_len, overlap_t, explicit_indices, seed, manual_rows_state, *manual_components],
         outputs=[logs, output_video, output_download, log_file, model_status],
     )
 
