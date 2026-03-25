@@ -11,15 +11,26 @@ from torchvision import transforms
 # ================= Configuration =================
 DEFAULT_PROMPT = "Super-Resolution and Restoration Task: Upscale this low-resolution image to high definition. The primary goal is to restore sharpness and clarity by effectively removing all types of degradation, including blur, heavy digital noise, grain, and JPEG compression artifacts."
 
-env_fal_key = os.environ.get("SPARKVSR_FAL_KEY") or os.environ.get("FAL_KEY")
-if env_fal_key:
-    os.environ["FAL_KEY"] = env_fal_key
-
 # Model ID
 FAL_MODEL_ID = "fal-ai/nano-banana-pro/edit"
 
 # Prompt
 TASK_PROMPT = os.environ.get("SPARKVSR_API_PROMPT", DEFAULT_PROMPT)
+
+
+def _resolve_fal_api_key(api_key=None):
+    resolved_api_key = (api_key or os.environ.get("SPARKVSR_FAL_KEY") or os.environ.get("FAL_KEY") or "").strip()
+    if not resolved_api_key:
+        raise ValueError("API Reference mode requires a FAL API key.")
+    os.environ["FAL_KEY"] = resolved_api_key
+    return resolved_api_key
+
+
+def _resolve_task_prompt(base_prompt=None):
+    if base_prompt is None:
+        return TASK_PROMPT
+    resolved_prompt = base_prompt.strip()
+    return resolved_prompt or DEFAULT_PROMPT
 
 
 # ==========================================
@@ -130,7 +141,7 @@ def save_ref_frames_locally(video_path=None, output_dir=None, video_id=None, tar
         cap.release()
     return frame_list
 
-def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, video_id=None, target_frames=None, is_match=False, specific_indices=None, prompt=None, ref_prompt_mode='fixed', resolution='1K'):
+def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, video_id=None, target_frames=None, is_match=False, specific_indices=None, prompt=None, ref_prompt_mode='fixed', resolution='1K', api_key=None, base_prompt=None):
     """
     Unified function to get reference frames via API.
     Can accept video_path OR video_tensor.
@@ -154,6 +165,9 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
     Returns:
         List[(int, torch.Tensor)]: List of (index, tensor).
     """
+    _resolve_fal_api_key(api_key)
+    task_prompt = _resolve_task_prompt(base_prompt)
+
     import fal_client
     import numpy as np
     import cv2
@@ -343,7 +357,7 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
             return completion.choices[0].message.content
         except Exception as e:
             print(f"[Warning] Degradation analysis failed: {e}")
-            return TASK_PROMPT # Fallback
+            return task_prompt # Fallback
 
     # -------------------------------------------------------------
     # 0. Helper: Caption Generation & Degradation Analysis
@@ -390,7 +404,7 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
         
         if ref_prompt_mode == 'fixed':
             # Mode 1: Fixed SR Prompt
-            api_prompt = TASK_PROMPT
+            api_prompt = task_prompt
             if prompt:
                  api_prompt += f" Target Scene Description: {prompt}"
             image_urls = [fal_client.upload_file(local_path)]

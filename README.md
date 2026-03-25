@@ -50,8 +50,6 @@ The container proxies nginx on port `7862` to Gradio on port `7860`.
    - `SPARKVSR_USERNAME` default `admin`
    - `SPARKVSR_PASSWORD` default `sparkvsr`
    - `HF_TOKEN` optional, but recommended for Hugging Face downloads
-   - `SPARKVSR_FAL_KEY` required for API Reference mode
-   - `SPARKVSR_API_PROMPT` optional override for the API enhancement prompt
 3. Launch on an RTX 5090 or A40 pod.
 
 On first boot, the startup script restores the app into `/workspace/SparkVSR`, downloads the required models, configures nginx auth, and launches Gradio. Subsequent restarts reuse the cached model directories in `/workspace/SparkVSR`.
@@ -61,7 +59,7 @@ The template only downloads `JiongzeYu/SparkVSR`. That Hugging Face repo already
 ## UI Behavior
 
 - `No Reference`: standard SparkVSR blind upscaling
-- `API Reference`: uses SparkVSR's upstream API-assisted reference path and requires `SPARKVSR_FAL_KEY`
+- `API Reference`: uses SparkVSR's upstream API-assisted reference path and exposes a masked `FAL API Key` field plus an editable `API Prompt` field directly in the Gradio UI
 - `Manual References`: lets the user provide frame-index/image pairs; the wrapper creates a synthetic `GT-Video` clip so SparkVSR can reuse its upstream `ref_mode=gt` flow
 
 PiSA-SR is intentionally not exposed in this template.
@@ -70,20 +68,26 @@ PiSA-SR is intentionally not exposed in this template.
 
 The wrapper uses temporal chunking to keep RAM usage under control on long videos. Chunk controls now live in the Gradio UI on a per-job basis. The default UI values are:
 
-- `Chunk Frames = 33`
+- `Chunk Frames = 49`
 - `Chunk Overlap = 8`
 
 Practical tuning path:
 
-- start with `33 / 8`
-- if you need lower memory usage, try `25 / 8` or `17 / 8`
-- if memory is still comfortable and you want fewer chunks, try `41 / 8`
+- start with `49 / 8`
+- if you need lower memory usage, try `41 / 8`, then `33 / 8`, then `25 / 8` or `17 / 8`
+- if memory is still comfortable and you want fewer chunks, try `57 / 8`
 - set `Chunk Frames = 0` and `Chunk Overlap = 0` to disable chunking entirely
 
 Practical tradeoff:
 
 - smaller chunk length: lower RAM and VRAM use, more overlap overhead, slower jobs
 - larger chunk length: fewer chunks, less repeated work, faster jobs, higher memory use
+
+Memory note:
+
+- input resolution is a major memory driver; higher source width and height increase decoded frame tensor size and intermediate activations
+- output resolution and upscale factor also matter heavily, especially on `x4` jobs
+- video duration mostly affects runtime when chunking is enabled, not peak memory
 
 ## Logs And Restart
 

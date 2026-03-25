@@ -30,13 +30,14 @@ OUTPUT_ROOT = APP_ROOT / "out"
 INPUT_ROOT = APP_ROOT / "in"
 MANUAL_REF_ROWS = 8
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-DEFAULT_UI_CHUNK_LEN = 33
+DEFAULT_UI_CHUNK_LEN = 49
 DEFAULT_UI_OVERLAP_T = 8
 
 if str(SUBTREE_ROOT) not in sys.path:
     sys.path.insert(0, str(SUBTREE_ROOT))
 
 import sparkvsr_inference_script as spark_module
+from finetune.utils.ref_utils import DEFAULT_PROMPT as DEFAULT_API_PROMPT
 from finetune.utils.ref_utils import _select_indices, get_ref_frames_api, save_ref_frames_locally
 
 
@@ -652,6 +653,8 @@ def collect_reference_frames(
     metadata: dict[str, int | Path | object],
     geometry: dict[str, int | float | None],
     explicit_indices: list[int],
+    api_key: str | None = None,
+    api_prompt: str | None = None,
 ):
     ref_frames_map: dict[int, torch.Tensor] = {}
 
@@ -704,6 +707,8 @@ def collect_reference_frames(
             specific_indices=ref_indices,
             ref_prompt_mode="fixed",
             resolution=api_resolution,
+            api_key=api_key,
+            base_prompt=api_prompt,
         )
         for idx in ref_indices:
             found = False
@@ -765,6 +770,8 @@ def run_single_video_job(
     explicit_indices: list[int],
     chunk_len_setting: int,
     overlap_t_setting: int,
+    api_key: str | None = None,
+    api_prompt: str | None = None,
 ):
     ref_mode = mode_to_ref_mode(mode)
     metadata = read_video_metadata(input_path)
@@ -776,6 +783,8 @@ def run_single_video_job(
         metadata=metadata,
         geometry=geometry,
         explicit_indices=explicit_indices,
+        api_key=api_key,
+        api_prompt=api_prompt,
     )
 
     chunk_len, overlap_t = get_chunk_settings(int(metadata["padded_frames"]), chunk_len_setting, overlap_t_setting)
@@ -986,6 +995,8 @@ def run_inference(
     chunk_len,
     overlap_t,
     explicit_indices,
+    api_key,
+    api_prompt,
     seed,
     manual_visible_rows,
     *manual_row_values,
@@ -1014,13 +1025,15 @@ def run_inference(
 
         parsed_resolution = parse_optional_resolution(output_resolution)
         api_indices = parse_ref_indices(explicit_indices)
+        resolved_api_key = (api_key or os.environ.get("SPARKVSR_FAL_KEY") or os.environ.get("FAL_KEY") or "").strip()
+        resolved_api_prompt = (api_prompt or "").strip() or DEFAULT_API_PROMPT
         parsed_chunk_len = parse_chunk_setting(chunk_len, "Chunk frames")
         parsed_overlap_t = parse_chunk_setting(overlap_t, "Chunk overlap")
         validate_chunk_settings(parsed_chunk_len, parsed_overlap_t)
         manual_refs = collect_manual_references(list(manual_row_values), manual_visible_rows)
 
-        if mode == "API Reference" and not (os.environ.get("SPARKVSR_FAL_KEY") or os.environ.get("FAL_KEY")):
-            raise ValueError("API Reference mode requires the `SPARKVSR_FAL_KEY` environment variable.")
+        if mode == "API Reference" and not resolved_api_key:
+            raise ValueError("API Reference mode requires a FAL API key in the UI.")
         if mode == "Manual References" and not manual_refs:
             raise ValueError("Manual References mode requires at least one frame-index/image pair.")
 
@@ -1107,6 +1120,8 @@ def run_inference(
                     explicit_indices=[index for index, _ in manual_refs] if mode == "Manual References" else api_indices,
                     chunk_len_setting=parsed_chunk_len,
                     overlap_t_setting=parsed_overlap_t,
+                    api_key=resolved_api_key if mode == "API Reference" else None,
+                    api_prompt=resolved_api_prompt if mode == "API Reference" else None,
                 ):
                     if event["type"] == "log":
                         yield emit(event["message"], None, None, str(log_path))
@@ -1136,6 +1151,7 @@ def update_mode_visibility(mode: str):
     api_visible = mode == "API Reference"
     return (
         gr.update(visible=manual_visible),
+        gr.update(visible=True),
         gr.update(visible=api_visible),
     )
 
@@ -1167,7 +1183,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
         """
         # SparkVSR on RunPod
         Upload a video, choose an inference mode, and run SparkVSR from this pod.
-        `API Reference` requires `SPARKVSR_FAL_KEY`. `Manual References` accepts up to 8 frame-index/image pairs.
+        `API Reference` uses a per-job FAL API key and editable prompt from the UI. `Manual References` accepts up to 8 frame-index/image pairs.
         """
     )
     model_status = gr.Markdown(get_model_status_text())
@@ -1201,16 +1217,30 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
                 precision=0,
                 info="Temporal overlap between chunks. Must be smaller than chunk frames. Use 0 when chunking is disabled.",
             )
-            explicit_indices = gr.Textbox(
-                label="Explicit Reference Indices",
-                placeholder="0,16,32",
-                info="Optional for API Reference mode. Leave blank to use upstream auto-selection.",
-            )
+            with gr.Group(visible=True) as api_config_group:
+                explicit_indices = gr.Textbox(
+                    label="Explicit Reference Indices",
+                    placeholder="0,16,32",
+                    info="Optional for API Reference mode. Leave blank to use upstream auto-selection.",
+                )
+                api_key = gr.Textbox(
+                    label="FAL API Key",
+                    type="password",
+                    placeholder="fal_...",
+                    value=os.environ.get("SPARKVSR_FAL_KEY", "") or os.environ.get("FAL_KEY", ""),
+                    info="Used only for API Reference mode. The field stays masked in the UI.",
+                )
+                api_prompt = gr.Textbox(
+                    label="API Prompt",
+                    lines=4,
+                    value=os.environ.get("SPARKVSR_API_PROMPT", DEFAULT_API_PROMPT),
+                    info="Base prompt for SparkVSR's API-assisted reference generation.",
+                )
             seed = gr.Number(label="Seed", value=42, precision=0)
 
         with gr.Column(scale=3):
             with gr.Group(visible=False) as api_hint_group:
-                gr.Markdown("`API Reference` uses SparkVSR's upstream API-assisted reference path and requires `SPARKVSR_FAL_KEY` in the container environment.")
+                gr.Markdown("`API Reference` uses SparkVSR's upstream API-assisted reference path. Enter a FAL API key above and adjust the base prompt here if needed.")
 
             with gr.Group(visible=False) as manual_group:
                 gr.Markdown("Add one row per manual reference. A row is used when it has a frame index and an uploaded image.")
@@ -1240,7 +1270,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
     mode.change(
         update_mode_visibility,
         inputs=[mode],
-        outputs=[manual_group, api_hint_group],
+        outputs=[manual_group, api_config_group, api_hint_group],
     )
     add_manual_row_button.click(
         add_manual_reference_row,
@@ -1257,7 +1287,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
     )
     run_button.click(
         run_inference,
-        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, chunk_len, overlap_t, explicit_indices, seed, manual_rows_state, *manual_components],
+        inputs=[input_video, mode, upscale, output_resolution, reference_guidance, cpu_offload, chunk_len, overlap_t, explicit_indices, api_key, api_prompt, seed, manual_rows_state, *manual_components],
         outputs=[logs, output_video, output_download, log_file, model_status],
     )
 
