@@ -30,7 +30,7 @@ OUTPUT_ROOT = APP_ROOT / "out"
 INPUT_ROOT = APP_ROOT / "in"
 MANUAL_REF_ROWS = 8
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-DEFAULT_UI_CHUNK_LEN = 49
+DEFAULT_UI_CHUNK_LEN = 33
 DEFAULT_UI_OVERLAP_T = 8
 
 if str(SUBTREE_ROOT) not in sys.path:
@@ -1228,7 +1228,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
                     type="password",
                     placeholder="fal_...",
                     value=os.environ.get("SPARKVSR_FAL_KEY", "") or os.environ.get("FAL_KEY", ""),
-                    info="Used only for API Reference mode. The field stays masked in the UI.",
+                    info="Used only for API Reference mode.",
                 )
                 api_prompt = gr.Textbox(
                     label="API Prompt",

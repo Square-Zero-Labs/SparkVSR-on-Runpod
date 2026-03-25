@@ -68,14 +68,14 @@ PiSA-SR is intentionally not exposed in this template.
 
 The wrapper uses temporal chunking to keep RAM usage under control on long videos. Chunk controls now live in the Gradio UI on a per-job basis. The default UI values are:
 
-- `Chunk Frames = 49`
+- `Chunk Frames = 33`
 - `Chunk Overlap = 8`
 
 Practical tuning path:
 
-- start with `49 / 8`
-- if you need lower memory usage, try `41 / 8`, then `33 / 8`, then `25 / 8` or `17 / 8`
-- if memory is still comfortable and you want fewer chunks, try `57 / 8`
+- start with `33 / 8`
+- if you need lower memory usage, try `25 / 8` or `17 / 8`
+- if memory is still comfortable and you want fewer chunks, try `41 / 8`, then `49 / 8`
 - set `Chunk Frames = 0` and `Chunk Overlap = 0` to disable chunking entirely
 
 Practical tradeoff:

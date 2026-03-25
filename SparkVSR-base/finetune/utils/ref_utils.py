@@ -230,7 +230,7 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
                 # Use prefix in filename
                 frame_filename = os.path.join(TEMP_INPUT_DIR, f"{prefix}frame_{idx:05d}.png")
                 cv2.imwrite(frame_filename, frame)
-                frame_list.append((idx, frame_filename))
+                frame_list.append((idx, read_idx, frame_filename))
             else:
                 extraction_failed_indices.append((idx, read_idx))
         cap.release()
@@ -280,14 +280,17 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
             img = Image.fromarray(frame_np)
             frame_filename = os.path.join(TEMP_INPUT_DIR, f"{prefix}frame_{idx:05d}.png")
             img.save(frame_filename)
-            frame_list.append((idx, frame_filename))
+            frame_list.append((idx, read_idx, frame_filename))
 
     processed_ref_frames = []
     
     # Sort frames by index
     frame_list.sort(key=lambda x: x[0])
-    extracted_indices = [idx for idx, _ in frame_list]
-    print(f"[API] Extracted {len(extracted_indices)} frame(s) for Fal: indices={extracted_indices}")
+    extracted_indices = [
+        {"requested_idx": requested_idx, "source_frame": source_frame}
+        for requested_idx, source_frame, _ in frame_list
+    ]
+    print(f"[API] Extracted {len(extracted_indices)} frame(s) for Fal: frames={extracted_indices}")
     if extraction_failed_indices:
         print(f"[API] Extraction failed for indices: {extraction_failed_indices}")
     
@@ -379,7 +382,7 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
     
     content_description = ""
     
-    for i, (idx, local_path) in enumerate(tqdm(frame_list, desc="SR Processing")):
+    for i, (idx, source_frame_idx, local_path) in enumerate(tqdm(frame_list, desc="SR Processing")):
         base_name = os.path.basename(local_path)
         save_path = os.path.join(TEMP_OUTPUT_DIR, base_name)
         
@@ -389,6 +392,10 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
                 img = Image.open(save_path).convert("RGB")
                 t_img = to_tensor(img) * 2.0 - 1.0
                 processed_ref_frames.append((idx, t_img))
+                print(
+                    "[API] Using cached Fal output: "
+                    f"requested_idx={idx} source_frame={source_frame_idx} saved_as={base_name}"
+                )
                 # Try to load existing content description if we are skipping frame 0
                 if i == 0:
                     caption_path = os.path.join(output_dir, "caption.txt")
@@ -407,6 +414,10 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
             api_prompt = task_prompt
             if prompt:
                  api_prompt += f" Target Scene Description: {prompt}"
+            print(
+                "[API] Sending frame to Fal: "
+                f"requested_idx={idx} source_frame={source_frame_idx} saved_as={base_name}"
+            )
             image_urls = [fal_client.upload_file(local_path)]
             
         else:
@@ -427,6 +438,10 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
             image_urls = []
             
             # 1. Upload Target (Current LQ)
+            print(
+                "[API] Sending frame to Fal: "
+                f"requested_idx={idx} source_frame={source_frame_idx} saved_as={base_name}"
+            )
             target_url = fal_client.upload_file(local_path)
             
             if i == 0:
@@ -468,6 +483,10 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
             
             t_img = to_tensor(img.convert("RGB")) * 2.0 - 1.0
             processed_ref_frames.append((idx, t_img))
+            print(
+                "[API] Retrieved Fal output: "
+                f"requested_idx={idx} source_frame={source_frame_idx} output_file={os.path.basename(save_path)}"
+            )
             
             # After Frame 0:
             if i == 0:
@@ -493,7 +512,7 @@ def get_ref_frames_api(video_path=None, output_dir=None, video_tensor=None, vide
                      f.write(api_prompt)
             
         except Exception as e:
-            print(f"[Error] API Failed for frame {idx}: {e}")
+            print(f"[Error] API Failed for requested_idx={idx} source_frame={source_frame_idx}: {e}")
             continue
 
     return processed_ref_frames
