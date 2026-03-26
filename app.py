@@ -349,6 +349,11 @@ def build_synthetic_gt_video(
     return fps_value
 
 
+def format_manual_reference_summary(references: list[tuple[int, Path]]) -> str:
+    parts = [f"frame={frame_index} image={image_path.name}" for frame_index, image_path in references]
+    return "Manual reference mapping: " + ", ".join(parts)
+
+
 def find_generated_video(output_dir: Path) -> Path:
     candidates = []
     for suffix in sorted(SUPPORTED_VIDEO_SUFFIXES):
@@ -844,6 +849,16 @@ def run_single_video_job(
             )
             print(start_message)
             yield {"type": "log", "message": start_message}
+            if ref_mode == "gt" and current_ref_indices:
+                ref_usage_message = " ".join(
+                    [
+                        f"Chunk {chunk_index}/{total_chunks} applying manual references.",
+                        f"chunk_frames={t_start}:{t_end}",
+                        f"reference_frames={current_ref_indices}",
+                    ]
+                )
+                print(ref_usage_message)
+                yield {"type": "log", "message": ref_usage_message}
 
             chunk_started_at = time.monotonic()
             chunk_lr = read_video_chunk(
@@ -1030,7 +1045,9 @@ def run_inference(
         parsed_chunk_len = parse_chunk_setting(chunk_len, "Chunk frames")
         parsed_overlap_t = parse_chunk_setting(overlap_t, "Chunk overlap")
         validate_chunk_settings(parsed_chunk_len, parsed_overlap_t)
-        manual_refs = collect_manual_references(list(manual_row_values), manual_visible_rows)
+        manual_refs: list[tuple[int, Path]] = []
+        if mode == "Manual References":
+            manual_refs = collect_manual_references(list(manual_row_values), manual_visible_rows)
 
         if mode == "API Reference" and not resolved_api_key:
             raise ValueError("API Reference mode requires a FAL API key in the UI.")
@@ -1079,6 +1096,7 @@ def run_inference(
                 command_input = staged_input
                 manual_indices = [index for index, _ in manual_refs]
                 yield emit("Prepared synthetic `GT-Video` staging for manual references.", None, None, str(log_path))
+                yield emit(format_manual_reference_summary(manual_refs), None, None, str(log_path))
             else:
                 fps = get_video_fps(original_input)
                 command_input = original_input
@@ -1151,7 +1169,7 @@ def update_mode_visibility(mode: str):
     api_visible = mode == "API Reference"
     return (
         gr.update(visible=manual_visible),
-        gr.update(visible=True),
+        gr.update(visible=api_visible),
         gr.update(visible=api_visible),
     )
 
@@ -1197,9 +1215,27 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
                 choices=["No Reference", "API Reference", "Manual References"],
                 value="No Reference",
             )
-            upscale = gr.Slider(label="Upscale Factor", minimum=1, maximum=4, step=1, value=4)
-            output_resolution = gr.Textbox(label="Optional Output Resolution", placeholder="720x1280")
-            reference_guidance = gr.Slider(label="Reference Guidance Scale", minimum=0.0, maximum=5.0, step=0.1, value=1.0)
+            upscale = gr.Slider(
+                label="Upscale Factor",
+                minimum=1,
+                maximum=4,
+                step=1,
+                value=4,
+                info="Used when Output Resolution is left blank.",
+            )
+            output_resolution = gr.Textbox(
+                label="Optional Output Resolution",
+                placeholder="720x1280",
+                info="If set, this exact output size overrides Upscale Factor.",
+            )
+            reference_guidance = gr.Slider(
+                label="Reference Guidance Scale",
+                minimum=0.0,
+                maximum=5.0,
+                step=0.1,
+                value=1.0,
+                info="Only applies in API Reference or Manual References mode.",
+            )
             cpu_offload = gr.Checkbox(
                 label="Low VRAM Mode (CPU Offload)",
                 value=False,
@@ -1217,7 +1253,7 @@ with gr.Blocks(title="SparkVSR RunPod", theme=gr.themes.Soft()) as demo:
                 precision=0,
                 info="Temporal overlap between chunks. Must be smaller than chunk frames. Use 0 when chunking is disabled.",
             )
-            with gr.Group(visible=True) as api_config_group:
+            with gr.Group(visible=False) as api_config_group:
                 explicit_indices = gr.Textbox(
                     label="Explicit Reference Indices",
                     placeholder="0,16,32",
