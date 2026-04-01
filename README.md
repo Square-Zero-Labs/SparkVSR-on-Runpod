@@ -4,6 +4,12 @@ This repository packages [SparkVSR](https://github.com/taco-group/SparkVSR) for 
 
 The upstream SparkVSR source is included as a git subtree in [`SparkVSR-base`](./SparkVSR-base). That subtree remains subject to the Apache 2.0 license defined upstream.
 
+## Tutorial
+
+Watch on [YouTube](https://youtu.be/M6fnBN_xUhw)
+
+[![Watch the YouTube tutorial](https://img.youtube.com/vi/M6fnBN_xUhw/hqdefault.jpg)](https://youtu.be/M6fnBN_xUhw)
+
 ## What This Template Provides
 
 - RunPod-ready Docker image based on `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
