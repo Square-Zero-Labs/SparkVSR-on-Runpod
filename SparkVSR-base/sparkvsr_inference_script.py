@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import logging
+import math
 
 import torch
 from torchvision import transforms
@@ -47,6 +48,7 @@ except ImportError:
 to_tensor = transforms.ToTensor()
 video_exts = ['.mp4', '.avi', '.mov', '.mkv']
 fr_metrics = ['psnr', 'ssim', 'lpips', 'dists']
+DEFAULT_MODEL_SPATIAL_MULTIPLE = 16
 
 
 def no_grad(func):
@@ -56,6 +58,22 @@ def no_grad(func):
     return wrapper
 
 
+def round_up_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        return value
+    return value + ((multiple - value % multiple) % multiple)
+
+
+def get_model_spatial_multiple(pipe) -> int:
+    try:
+        vae_scale = 2 ** (len(pipe.vae.config.block_out_channels) - 1)
+        patch_size = int(pipe.transformer.config.patch_size)
+        return max(1, int(vae_scale) * patch_size)
+    except Exception:
+        return DEFAULT_MODEL_SPATIAL_MULTIPLE
+
+
+def is_video_file(filename: str) -> bool:
     return any(filename.lower().endswith(ext) for ext in video_exts)
 
 
@@ -685,6 +703,7 @@ def main():
     if args.is_vae_st:
         pipe.vae.enable_slicing()
         pipe.vae.enable_tiling()
+    model_spatial_multiple = get_model_spatial_multiple(pipe)
         
     # Metrics
     if args.eval_metrics:
@@ -731,8 +750,8 @@ def main():
             scale_w = target_w / src_w
             scale_factor = max(scale_h, scale_w)  # Ensure both dims >= target
             
-            scaled_h = int(src_h * scale_factor)
-            scaled_w = int(src_w * scale_factor)
+            scaled_h = math.ceil(src_h * scale_factor)
+            scaled_w = math.ceil(src_w * scale_factor)
             
             print(f"Output Resolution Mode: {target_h}x{target_w}")
             print(f"  Source: {src_h}x{src_w} | Scale: {scale_factor:.4f} -> Scaled: {scaled_h}x{scaled_w}")
@@ -751,22 +770,31 @@ def main():
             video_up = video_up[:, :, crop_top:crop_top + target_h, crop_left:crop_left + target_w]
             print(f"  Center crop: top={crop_top} left={crop_left} -> Final: {target_h}x{target_w}")
             
-            # Step 3: Pad to VAE-compatible size (multiple of 8)
-            pad_h_extra = (8 - target_h % 8) % 8
-            pad_w_extra = (8 - target_w % 8) % 8
+            # Step 3: Pad to model-compatible size. CogVideoX encodes spatially
+            # through the VAE and then groups latent pixels into transformer patches.
+            pad_h_extra = round_up_to_multiple(target_h, model_spatial_multiple) - target_h
+            pad_w_extra = round_up_to_multiple(target_w, model_spatial_multiple) - target_w
             if pad_h_extra > 0 or pad_w_extra > 0:
                 video_up = torch.nn.functional.pad(video_up, (0, pad_w_extra, 0, pad_h_extra))
-                print(f"  VAE pad: +{pad_h_extra}h +{pad_w_extra}w -> {target_h + pad_h_extra}x{target_w + pad_w_extra}")
+                print(f"  Model pad: +{pad_h_extra}h +{pad_w_extra}w -> {target_h + pad_h_extra}x{target_w + pad_w_extra}")
             
             # Set effective upscale to 1 for downstream padding removal
             effective_upscale = 1
+            output_pad_h = pad_h_extra
+            output_pad_w = pad_w_extra
         else:
+            process_h = H_orig * args.upscale
+            process_w = W_orig * args.upscale
+            padded_process_h = round_up_to_multiple(process_h, model_spatial_multiple)
+            padded_process_w = round_up_to_multiple(process_w, model_spatial_multiple)
             video_up = torch.nn.functional.interpolate(
                 video, 
-                size=(H_orig * args.upscale, W_orig * args.upscale),
+                size=(padded_process_h, padded_process_w),
                 mode=args.upscale_mode,
                 align_corners=False
             )
+            output_pad_h = padded_process_h - (original_shape[1] * args.upscale)
+            output_pad_w = padded_process_w - (original_shape[2] * args.upscale)
             effective_upscale = args.upscale
         
         # Normalize to [-1, 1]
@@ -1072,7 +1100,7 @@ def main():
         video_generate = output_video
         
         # Save
-        video_generate = remove_padding_and_extra_frames(video_generate, pad_f, pad_h*effective_upscale, pad_w*effective_upscale)
+        video_generate = remove_padding_and_extra_frames(video_generate, pad_f, output_pad_h, output_pad_w)
         file_name = os.path.basename(video_path)
         
         out_file_path = os.path.join(args.output_path, file_name)

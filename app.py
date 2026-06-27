@@ -4,6 +4,7 @@ import contextlib
 import gc
 import imageio
 import json
+import math
 import os
 import shlex
 import shutil
@@ -32,6 +33,7 @@ MANUAL_REF_ROWS = 8
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 DEFAULT_UI_CHUNK_LEN = 33
 DEFAULT_UI_OVERLAP_T = 8
+DEFAULT_MODEL_SPATIAL_MULTIPLE = 16
 
 if str(SUBTREE_ROOT) not in sys.path:
     sys.path.insert(0, str(SUBTREE_ROOT))
@@ -111,6 +113,23 @@ def validate_reference_indices(indices: Iterable[int]) -> None:
     for previous, current in zip(indices, indices[1:]):
         if current - previous < 4:
             raise ValueError("Reference indices must be at least 4 frames apart.")
+
+
+def round_up_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        return value
+    return value + ((multiple - value % multiple) % multiple)
+
+
+def get_model_spatial_multiple(pipe=None) -> int:
+    if pipe is None:
+        return DEFAULT_MODEL_SPATIAL_MULTIPLE
+    try:
+        vae_scale = 2 ** (len(pipe.vae.config.block_out_channels) - 1)
+        patch_size = int(pipe.transformer.config.patch_size)
+        return max(1, int(vae_scale) * patch_size)
+    except Exception:
+        return DEFAULT_MODEL_SPATIAL_MULTIPLE
 
 
 def resize_to_cover(image_bgr, width: int, height: int):
@@ -533,7 +552,12 @@ def read_video_metadata(video_path: Path) -> dict[str, int | Path | object]:
     }
 
 
-def compute_output_geometry(metadata: dict[str, int | Path | object], upscale: int, output_resolution: tuple[int, int] | None) -> dict[str, int | float | None]:
+def compute_output_geometry(
+    metadata: dict[str, int | Path | object],
+    upscale: int,
+    output_resolution: tuple[int, int] | None,
+    spatial_multiple: int = DEFAULT_MODEL_SPATIAL_MULTIPLE,
+) -> dict[str, int | float | None]:
     input_height = int(metadata["height"]) + int(metadata["pad_h"])
     input_width = int(metadata["width"]) + int(metadata["pad_w"])
 
@@ -542,12 +566,12 @@ def compute_output_geometry(metadata: dict[str, int | Path | object], upscale: i
         scale_h = final_output_h / input_height
         scale_w = final_output_w / input_width
         scale_factor = max(scale_h, scale_w)
-        scaled_h = int(input_height * scale_factor)
-        scaled_w = int(input_width * scale_factor)
+        scaled_h = math.ceil(input_height * scale_factor)
+        scaled_w = math.ceil(input_width * scale_factor)
         crop_top = (scaled_h - final_output_h) // 2
         crop_left = (scaled_w - final_output_w) // 2
-        output_pad_h = (8 - final_output_h % 8) % 8
-        output_pad_w = (8 - final_output_w % 8) % 8
+        output_pad_h = round_up_to_multiple(final_output_h, spatial_multiple) - final_output_h
+        output_pad_w = round_up_to_multiple(final_output_w, spatial_multiple) - final_output_w
         process_output_h = final_output_h + output_pad_h
         process_output_w = final_output_w + output_pad_w
         effective_upscale = 1
@@ -557,10 +581,12 @@ def compute_output_geometry(metadata: dict[str, int | Path | object], upscale: i
         scaled_w = None
         crop_top = 0
         crop_left = 0
-        output_pad_h = int(metadata["pad_h"]) * upscale
-        output_pad_w = int(metadata["pad_w"]) * upscale
-        process_output_h = input_height * upscale
-        process_output_w = input_width * upscale
+        base_process_h = input_height * upscale
+        base_process_w = input_width * upscale
+        process_output_h = round_up_to_multiple(base_process_h, spatial_multiple)
+        process_output_w = round_up_to_multiple(base_process_w, spatial_multiple)
+        output_pad_h = process_output_h - (int(metadata["height"]) * upscale)
+        output_pad_w = process_output_w - (int(metadata["width"]) * upscale)
         final_output_h = int(metadata["height"]) * upscale
         final_output_w = int(metadata["width"]) * upscale
         effective_upscale = upscale
@@ -780,7 +806,7 @@ def run_single_video_job(
 ):
     ref_mode = mode_to_ref_mode(mode)
     metadata = read_video_metadata(input_path)
-    geometry = compute_output_geometry(metadata, upscale, output_resolution)
+    geometry = compute_output_geometry(metadata, upscale, output_resolution, get_model_spatial_multiple(pipe))
     ref_frames_map, ref_indices = collect_reference_frames(
         ref_mode=ref_mode,
         source_video=input_path,
